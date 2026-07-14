@@ -1,8 +1,14 @@
+import os
+
+_repo_root = os.path.dirname(os.path.abspath(__file__))
+
 # -----------------
 # DATASET ROOTS
 # -----------------
-cifar_10_root = '/home/zbc/datasets/cifar10'
-cifar_100_root = '/home/zbc/datasets/cifar100'
+# torchvision downloads CIFAR here on first run (download=True). The on-disk
+# location does not affect sample ordering, so annotation uq_idx alignment holds.
+cifar_10_root = os.path.join(_repo_root, 'data', 'datasets', 'cifar10')
+cifar_100_root = os.path.join(_repo_root, 'data', 'datasets', 'cifar100')
 cub_root = '/disk/scratch_fast/bingchen/ssb/cub/'
 aircraft_root = '/data/user-data/fgvc/aircraft/fgvc-aircraft-2013b'
 
@@ -18,12 +24,26 @@ imagenet_root = '/data/user-data/imagenet'
 osr_split_dir = '/afs/inf.ed.ac.uk/user/s23/s2329503/GPC-shared/data/ssb_splits/'
 
 # -----------------
+# CONCEPT ANNOTATIONS (VLG-CBM Grounding-DINO output)
+# -----------------
+# Root holding per-dataset concept annotation folders, e.g.
+#   data/annotations/cifar10_train/{uq_idx}.json
+#   data/annotations/cifar10_val/{uq_idx}.json
+concept_annotation_root = os.path.join(_repo_root, 'data', 'annotations')
+
+# dataset_name -> (train subfolder, val/test subfolder)
+concept_annotation_dirs = {
+    'cifar10': ('cifar10_train', 'cifar10_val'),
+    'cifar100': ('cifar100_train', 'cifar100_val'),
+}
+
+# -----------------
 # OTHER PATHS
 # -----------------
 dino_pretrain_path = '/disk/scratch_fast/bingchen/cache_root/torch/hub/checkpoints/dino_vitbase16_pretrain.pth'
 mae_inat_pretrain_path = '/home/zbc/mae/output_dir_inat_mini/ep400/checkpoint-399.pth'
 feature_extract_dir = '/home/zbc/universal-category-discovery/ext_features'     # Extract features to this directory
-exp_root = '/home/zbc/universal-category-discovery/dev_outputs/inat_mini/'          # All logs and checkpoints will be saved here
+exp_root = os.path.join(_repo_root, 'exp')          # All logs and checkpoints will be saved here
 
 
 # -----------------

@@ -100,7 +100,7 @@ def get_cifar_10_datasets(train_transform, test_transform, train_classes=(0, 1, 
     np.random.seed(seed)
 
     # Init entire training set
-    whole_training_set = CustomCIFAR10(root=cifar_10_root, transform=train_transform, train=True)
+    whole_training_set = CustomCIFAR10(root=cifar_10_root, transform=train_transform, train=True, download=True)
 
     # Get labelled training set which has subsampled classes, then subsample some indices from that
     train_dataset_labelled = subsample_classes(deepcopy(whole_training_set), include_classes=train_classes)
@@ -118,7 +118,7 @@ def get_cifar_10_datasets(train_transform, test_transform, train_classes=(0, 1, 
     train_dataset_unlabelled = subsample_dataset(deepcopy(whole_training_set), np.array(list(unlabelled_indices)))
 
     # Get test set for all classes
-    test_dataset = CustomCIFAR10(root=cifar_10_root, transform=test_transform, train=False)
+    test_dataset = CustomCIFAR10(root=cifar_10_root, transform=test_transform, train=False, download=True)
 
     # Either split train into train and val or use test set as val
     train_dataset_labelled = train_dataset_labelled_split if split_train_val else train_dataset_labelled
@@ -140,7 +140,7 @@ def get_cifar_100_datasets(train_transform, test_transform, train_classes=range(
     np.random.seed(seed)
 
     # Init entire training set
-    whole_training_set = CustomCIFAR100(root=cifar_100_root, transform=train_transform, train=True)
+    whole_training_set = CustomCIFAR100(root=cifar_100_root, transform=train_transform, train=True, download=True)
 
     # Get labelled training set which has subsampled classes, then subsample some indices from that
     train_dataset_labelled = subsample_classes(deepcopy(whole_training_set), include_classes=train_classes)
@@ -158,7 +158,7 @@ def get_cifar_100_datasets(train_transform, test_transform, train_classes=range(
     train_dataset_unlabelled = subsample_dataset(deepcopy(whole_training_set), np.array(list(unlabelled_indices)))
 
     # Get test set for all classes
-    test_dataset = CustomCIFAR100(root=cifar_100_root, transform=test_transform, train=False)
+    test_dataset = CustomCIFAR100(root=cifar_100_root, transform=test_transform, train=False, download=True)
 
     # Either split train into train and val or use test set as val
     train_dataset_labelled = train_dataset_labelled_split if split_train_val else train_dataset_labelled
@@ -200,7 +200,7 @@ def get_cifar_100_ucd_datasets(train_transform, test_transform, labelled_classes
     # train_dataset_unlabelled = subsample_dataset(deepcopy(whole_training_set), np.array(list(unlabelled_indices)))
 
     # Get test set for all classes
-    test_dataset = CustomCIFAR100(root=cifar_100_root, transform=test_transform, train=False)
+    test_dataset = CustomCIFAR100(root=cifar_100_root, transform=test_transform, train=False, download=True)
 
     # Either split train into train and val or use test set as val
     train_dataset_labelled = train_dataset_labelled_split if split_train_val else train_dataset_labelled

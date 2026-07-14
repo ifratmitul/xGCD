@@ -1,0 +1,136 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: xgcd-cifar10-stage1
+  namespace: longweiwangusd
+spec:
+  template:
+    spec:
+      containers:
+      - name: xgcd-container
+        image: continuumio/anaconda3:latest
+        command: ["/bin/bash"]
+        args:
+          - "-c"
+          - |
+            set -e
+
+            # GPU Verification
+            echo "=========================================="
+            echo "Verifying GPU availability..."
+            echo "=========================================="
+            sleep 5
+            nvidia-smi || (echo "ERROR: GPU not accessible!" && exit 1)
+
+            export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+            cd /data/xGCD
+
+            # Initialize conda
+            source /opt/conda/etc/profile.d/conda.sh
+
+            # Setup environment (creates env 'xGCD', caches DINO weights)
+            echo "=========================================="
+            echo "Running setup.sh..."
+            echo "=========================================="
+            bash setup.sh
+            conda activate xGCD
+
+            # Verify installation
+            python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'; print(f'PyTorch {torch.__version__} / CUDA {torch.version.cuda}')"
+            python -c "import wandb; print(f'wandb {wandb.__version__}')"
+            python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
+
+            mkdir -p exp data/datasets logs/wandb
+
+            # ============================================================
+            # xGCD — Stage 1: CBL pre-training on CIFAR-10 (5 known / 5 novel)
+            # (Stage 2 will be added once implemented.)
+            # ============================================================
+            DATASET="cifar10"
+            EXP_NAME="stage1_cbl_cifar10"
+            CONF_THR="0.15"
+
+            WANDB_PROJECT="xGCD"
+            WANDB_ENTITY="ifrat-ikhtear-university-of-south-dakota"
+            export WANDB_DIR="logs"   # offline run data under logs/wandb/
+
+            # Set SMOKE=1 in the job for a fast 2-epoch integration run.
+            SMOKE="${SMOKE:-0}"
+            if [ "$SMOKE" = "1" ]; then STAGE1_EPOCHS=2; else STAGE1_EPOCHS=50; fi
+
+            echo "=========================================="
+            echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
+            echo "=========================================="
+
+            CBL_OUT="exp/${EXP_NAME}"
+            if [ -f "$CBL_OUT/cbl_stage1.pt" ]; then
+                echo "--- Stage 1 already done ($CBL_OUT/cbl_stage1.pt exists) — skipping ---"
+            else
+                python -m methods.contrastive_training.stage1_cbl \
+                    --dataset_name "$DATASET" \
+                    --prop_train_labels 0.5 \
+                    --concept_conf_threshold "$CONF_THR" \
+                    --cbl_epochs "$STAGE1_EPOCHS" \
+                    --cbl_lr 1e-4 \
+                    --cbl_weight_decay 1e-5 \
+                    --cbl_batch_size 256 \
+                    --batch_size 128 \
+                    --num_workers 4 \
+                    --exp_name "$EXP_NAME" \
+                    --use_wandb True \
+                    --wandb_project "$WANDB_PROJECT" \
+                    --wandb_entity "$WANDB_ENTITY"
+            fi
+
+            # Guard: confirm Stage-1 artifacts exist.
+            if [ ! -f "$CBL_OUT/cbl_stage1.pt" ] || [ ! -f "$CBL_OUT/vocab.json" ]; then
+                echo "ERROR: Stage 1 outputs missing in $CBL_OUT (cbl_stage1.pt / vocab.json)."
+                exit 1
+            fi
+
+            echo ""
+            echo "=========================================="
+            echo "Stage 1 COMPLETED — CBL: $CBL_OUT"
+            echo "=========================================="
+            ls -la "$CBL_OUT" 2>/dev/null || true
+
+            # Sync any offline wandb runs (no-op when logged online)
+            if [ -d "logs/wandb" ]; then
+                for run_dir in logs/wandb/offline-run-*; do
+                    [ -d "$run_dir" ] || continue
+                    echo "Syncing offline wandb run: $run_dir"
+                    wandb sync "$run_dir" --project "$WANDB_PROJECT" --entity "$WANDB_ENTITY" \
+                        || echo "Warning: failed to sync $run_dir"
+                done
+            fi
+            echo "View results: https://wandb.ai/$WANDB_ENTITY/$WANDB_PROJECT"
+            echo "Job finished!"
+
+        volumeMounts:
+        - name: data-storage
+          mountPath: /data
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            memory: "32Gi"
+            cpu: "4"
+            nvidia.com/rtxa6000: 1
+          limits:
+            memory: "32Gi"
+            cpu: "4"
+            nvidia.com/rtxa6000: 1
+        env:
+        - name: WANDB_API_KEY
+          value: "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"
+      volumes:
+      - name: data-storage
+        persistentVolumeClaim:
+          claimName: vindr-cxr-pvc
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
+      restartPolicy: Never
+  backoffLimit: 0
