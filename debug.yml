@@ -17,11 +17,9 @@ spec:
       requests:
         memory: "16Gi"
         cpu: "4"
-        nvidia.com/gpu: 1
       limits:
         memory: "16Gi"
         cpu: "4"
-        nvidia.com/gpu: 1
   volumes:
   - name: data-storage
     persistentVolumeClaim:

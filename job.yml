@@ -55,9 +55,13 @@ spec:
             WANDB_ENTITY="ifrat-ikhtear-university-of-south-dakota"
             export WANDB_DIR="logs"   # offline run data under logs/wandb/
 
-            # Set SMOKE=1 in the job for a fast 2-epoch integration run.
+            # Set SMOKE=1 in the job for a fast integration run.
             SMOKE="${SMOKE:-0}"
-            if [ "$SMOKE" = "1" ]; then STAGE1_EPOCHS=2; else STAGE1_EPOCHS=50; fi
+            if [ "$SMOKE" = "1" ]; then
+                STAGE1_EPOCHS=2; WARMUP=2; STAGE2_EPOCHS=4; REFRESH=2
+            else
+                STAGE1_EPOCHS=50; WARMUP=20; STAGE2_EPOCHS=200; REFRESH=5
+            fi
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -88,12 +92,41 @@ spec:
                 echo "ERROR: Stage 1 outputs missing in $CBL_OUT (cbl_stage1.pt / vocab.json)."
                 exit 1
             fi
+            echo "Stage 1 COMPLETED — CBL: $CBL_OUT"
+            ls -la "$CBL_OUT" 2>/dev/null || true
+
+            # ============================================================
+            # xGCD — Stage 2: joint novel-class discovery + GCD
+            # ============================================================
+            S2_OUT="exp/stage2_xgcd_${DATASET}"
+            echo "=========================================="
+            echo "Stage 2: xGCD | warmup=$WARMUP joint_epochs=$STAGE2_EPOCHS refresh=$REFRESH"
+            echo "=========================================="
+            python -m methods.contrastive_training.xgcd \
+                --dataset_name "$DATASET" \
+                --cbl_dir "$CBL_OUT" \
+                --prop_train_labels 0.5 \
+                --concept_conf_threshold "$CONF_THR" \
+                --warmup_epochs "$WARMUP" \
+                --epochs "$STAGE2_EPOCHS" \
+                --refresh_period "$REFRESH" \
+                --lambda_warmup 20 \
+                --novelty_alpha 0.05 \
+                --alpha_fidelity 0.1 \
+                --lr 0.1 \
+                --cbl_lr_divisor 100 \
+                --batch_size 128 \
+                --num_workers 4 \
+                --exp_name "stage2_xgcd_${DATASET}" \
+                --use_wandb True \
+                --wandb_project "$WANDB_PROJECT" \
+                --wandb_entity "$WANDB_ENTITY"
 
             echo ""
             echo "=========================================="
-            echo "Stage 1 COMPLETED — CBL: $CBL_OUT"
+            echo "xGCD PIPELINE COMPLETED — Stage1: $CBL_OUT | Stage2: $S2_OUT"
             echo "=========================================="
-            ls -la "$CBL_OUT" 2>/dev/null || true
+            ls -la "$S2_OUT" 2>/dev/null || true
 
             # Sync any offline wandb runs (no-op when logged online)
             if [ -d "logs/wandb" ]; then

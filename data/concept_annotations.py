@@ -1,24 +1,3 @@
-"""Stage D — concept annotation layer (VLG-CBM Grounding-DINO output).
-
-Three pieces, all keyed by CIFAR `uq_idx` (= native torchvision index = JSON filename):
-
-  build_concept_vocabulary(...)  -> the concept vocabulary S~  (VLG-CBM Eq 3),
-                                    built from the *labelled known-class* images only.
-  ConceptTargetLookup            -> uq_idx -> binary concept target o_i in {0,1}^C
-                                    (VLG-CBM Eq 4), a standalone service (no dataset edits).
-  get_concept_vocab_and_lookup   -> convenience: build/cache vocab, set args.num_concepts,
-                                    return (vocab, train_lookup).
-
-Design notes
-------------
-* Vocabulary axes come from labelled known classes only, so novel category names never
-  leak in. Targets o_i are then computed for *any* image against that fixed axis set;
-  supervision (BCE) is applied to labelled images only (masking happens in the trainer).
-* A detection contributes concept s_j iff its confidence logit t_j > threshold
-  (VLG-CBM Eq 2, default T = 0.15).
-* Box coordinates are ignored — o_i is presence/absence only, so the 32->224 resize and
-  the absence of crop augmentation are irrelevant here.
-"""
 import json
 import os
 from typing import Dict, List, Optional, Sequence
