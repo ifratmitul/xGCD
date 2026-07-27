@@ -184,8 +184,17 @@ def run_xgcd(args):
                               num_workers=args.num_workers, drop_last=True)
 
     total_epochs = args.warmup_epochs + args.epochs
-    optimizer = torch.optim.SGD(model.param_groups(args.lr, args.lr / args.cbl_lr_divisor),
-                                momentum=0.9, weight_decay=args.weight_decay)
+    if args.freeze_backbone:
+        # anti-forgetting: keep the DINO features fixed, adapt only the concept layer.
+        # The CBL is a sensitive linear layer (Stage 1 trained it at 1e-4) -> use the
+        # small, explicit --cbl_lr, NOT the backbone lr (0.1 diverges immediately).
+        for p in model.backbone.parameters():
+            p.requires_grad_(False)
+        param_groups = [{"params": list(model.cbl.parameters()), "lr": args.cbl_lr}]
+        logger.info(f"Backbone FROZEN — training CBL only at lr={args.cbl_lr}")
+    else:
+        param_groups = model.param_groups(args.lr, args.lr / args.cbl_lr_divisor)
+    optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
 
     # baseline eval (epoch 0): the starting point straight from the Stage-1 CBL, before
@@ -216,6 +225,8 @@ def run_xgcd(args):
 
         # ---- M-step ----
         model.train()
+        if args.freeze_backbone:
+            model.backbone.eval()   # frozen feature extractor -> no dropout/drop-path noise
         agg = dict(L_cl=0.0, L_pcl=0.0, L_bce=0.0, loss=0.0)
         nb = 0
         for batch in loader:
@@ -226,6 +237,10 @@ def run_xgcd(args):
                 images, labels, uq, mask_lab = batch
             loss, parts = mstep_loss(model, images, labels, uq, mask_lab, state,
                                      lookup, pos_weight, lambda_t, args, device)
+            if not torch.isfinite(loss):
+                logger.error(f"[xGCD] non-finite loss at epoch {epoch+1} — diverged. "
+                             f"Lower --cbl_lr / --lr or set --grad_clip.")
+                raise RuntimeError("Stage 2 diverged (non-finite loss).")
             optimizer.zero_grad()
             loss.backward()
             if args.grad_clip > 0:
@@ -355,7 +370,11 @@ def get_xgcd_parser():
     p.add_argument("--dpmm_min_pool", type=int, default=10)
     # optim
     p.add_argument("--lr", type=float, default=0.1)
-    p.add_argument("--cbl_lr_divisor", type=float, default=100.0, help="CBL LR = lr / this")
+    p.add_argument("--cbl_lr_divisor", type=float, default=100.0, help="CBL LR = lr / this (non-frozen)")
+    p.add_argument("--cbl_lr", type=float, default=1e-3,
+                   help="explicit CBL LR used when --freeze_backbone (0.1 diverges; 1e-3 is safe)")
+    p.add_argument("--freeze_backbone", type=str2bool, default=False,
+                   help="freeze DINO backbone, train only the CBL at --cbl_lr (anti-forgetting)")
     p.add_argument("--weight_decay", type=float, default=5e-5)
     p.add_argument("--grad_clip", type=float, default=0.0)
     # io
