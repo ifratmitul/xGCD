@@ -64,13 +64,16 @@ spec:
                 STAGE1_EPOCHS=50; WARMUP=5; STAGE2_EPOCHS=30; REFRESH=2
             fi
 
-            # ---- Run 1 Stage-2 hyperparameters (freeze backbone, stronger anchor) ----
+            # ---- Run 2 Stage-2 hyperparameters (fixes 1-4: empirical tau, live L_CL,
+            #      anti-contamination PCL) on top of the frozen-backbone control ----
             FREEZE_BACKBONE="True"
             CBL_LR="1e-3"          # CBL LR when frozen (0.1 diverges!)
             ALPHA_FIDELITY="0.5"
             NOVELTY_ALPHA="0.2"
+            TAU_MODE="empirical"   # data-calibrated gate threshold (vs chi2)
+            PCL_KNOWN_UNLAB_W="0.0"  # drop unlabelled-assigned-known from L_PCL (anti-forgetting)
             GRAD_CLIP="1.0"        # safety net against blow-ups
-            S2_EXP="stage2_freeze_test"
+            S2_EXP="stage2_fixes_test"
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -124,7 +127,9 @@ spec:
                 --freeze_backbone "$FREEZE_BACKBONE" \
                 --cbl_lr "$CBL_LR" \
                 --novelty_alpha "$NOVELTY_ALPHA" \
+                --tau_mode "$TAU_MODE" \
                 --alpha_fidelity "$ALPHA_FIDELITY" \
+                --pcl_known_unlab_weight "$PCL_KNOWN_UNLAB_W" \
                 --grad_clip "$GRAD_CLIP" \
                 --lr 0.1 \
                 --cbl_lr_divisor 100 \

@@ -49,20 +49,27 @@ def build_concept_vocabulary(
     images. `uq_idxs` should be the labelled known-class indices. Returns a sorted list
     (deterministic concept -> index mapping)."""
     counts: Dict[str, int] = {}
+    raw_concepts = set()          # every concept seen at ANY confidence (pre-threshold)
     missing = 0
     for uq in uq_idxs:
         p = annotation_path(ann_dir, uq)
         if not os.path.exists(p):
             missing += 1
             continue
-        for c in concepts_present(p, threshold):
+        present = set()
+        for lbl, logit in parse_annotation_file(p):
+            raw_concepts.add(lbl)          # pre-filter universe (any logit)
+            if logit > threshold:
+                present.add(lbl)           # per-image, above threshold
+        for c in present:
             counts[c] = counts.get(c, 0) + 1
     if missing:
         logger.warning(f"{missing}/{len(uq_idxs)} annotation files missing under {ann_dir}")
     vocab = sorted([c for c, n in counts.items() if n >= min_images])
     logger.info(
-        f"Built concept vocabulary: {len(vocab)} concepts "
-        f"(threshold={threshold}, min_images={min_images}, from {len(uq_idxs)} labelled imgs)"
+        f"Concept vocabulary: {len(raw_concepts)} raw concepts (pre-threshold) "
+        f"-> {len(counts)} after logit>{threshold} "
+        f"-> {len(vocab)} final (min_images={min_images}), from {len(uq_idxs)} labelled imgs"
     )
     return vocab
 
