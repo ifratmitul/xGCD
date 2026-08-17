@@ -25,7 +25,7 @@ from data.cifar import get_cifar_10_datasets, get_cifar_100_datasets
 from data.concept_annotations import get_concept_vocab_and_lookup, load_vocabulary, ConceptTargetLookup
 from data.data_utils import MergedDataset
 from data.splits import configure_splits
-from methods.contrastive_training.extract import extract_concept_logits
+from methods.contrastive_training.extract import extract_concept_logits, extract_backbone_features
 from methods.contrastive_training.stage1_cbl import get_device, init_wandb
 from methods.gcd.estep import run_estep
 from methods.gcd.lda_gaussian import LDAGaussian
@@ -62,7 +62,8 @@ def build_data(args):
 # E-step (atomic snapshot)
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def compute_estep(model, lab_loader, unlab_loader, phase, args, device):
+def compute_estep(model, lab_loader, unlab_loader, phase, args, device, prev_state=None,
+                  frozen_lda=None):
     model.eval()
     lab_logits, lab_labels, lab_uq, _ = extract_concept_logits(model, lab_loader, device)
 
@@ -77,7 +78,14 @@ def compute_estep(model, lab_loader, unlab_loader, phase, args, device):
         return state
 
     unlab_logits, unlab_labels, unlab_uq, _ = extract_concept_logits(model, unlab_loader, device)
-    res = run_estep(lab_logits, lab_labels, unlab_logits, args)
+
+    # warm-start the DPMM from the previous E-step's assignments (if enabled + available)
+    prev_assign_unlab = None
+    if (getattr(args, "dpmm_warm_start", True) and prev_state is not None
+            and prev_state.get("assign_by_uq") is not None):
+        prev_assign_unlab = prev_state["assign_by_uq"][unlab_uq.long().to(device)].cpu()
+    res = run_estep(lab_logits, lab_labels, unlab_logits, args,
+                    prev_assign_unlab=prev_assign_unlab, frozen_lda=frozen_lda)
 
     max_uq = int(max(int(lab_uq.max()), int(unlab_uq.max()))) + 1
     assign_by_uq = torch.zeros(max_uq, dtype=torch.long, device=device)
@@ -95,9 +103,35 @@ def compute_estep(model, lab_loader, unlab_loader, phase, args, device):
 # --------------------------------------------------------------------------- #
 # M-step loss on one (2-view) batch
 # --------------------------------------------------------------------------- #
-def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, lambda_t, args, device):
+def _known_feature_basis(feats: torch.Tensor, energy: float = 0.99) -> torch.Tensor:
+    """Orthonormal basis [in, r] spanning the top known-feature directions (>= `energy` of
+    the feature variance). Weight updates orthogonal to this span leave W @ f_known fixed."""
+    feats = feats.float()
+    _, S, Vt = torch.linalg.svd(feats, full_matrices=False)          # Vt: [k, in]
+    cum = torch.cumsum(S ** 2, 0) / torch.clamp(torch.sum(S ** 2), min=1e-12)
+    r = int((cum < energy).sum().item()) + 1
+    r = max(1, min(r, Vt.shape[0]))
+    return Vt[:r].t().contiguous()                                   # [in, r]
+
+
+def _apply_known_protection(cbl, known_proj):
+    """After an optimiser step, snap the CBL's known-feature directions back to their
+    phase-1 values so W @ f_known (and the bias) stay exactly fixed. Robust to weight
+    decay / momentum because it constrains the weight itself, not the gradient."""
+    UUt, W0_known, b0 = known_proj
+    lin = cbl.model[0]
+    with torch.no_grad():
+        W = lin.weight
+        W.sub_(W @ UUt).add_(W0_known)          # replace known component with frozen phase-1 one
+        if b0 is not None:
+            lin.bias.copy_(b0)
+
+
+def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, lambda_t, args, device,
+               frozen_cbl=None):
     v = torch.cat([images[0], images[1]], dim=0).to(device)     # [2B, ...]
-    logits = model(v)
+    feat = model.backbone(v)                                    # backbone features (reused for anchor)
+    logits = model.cbl(feat)                                    # == model(v)
     B = images[0].shape[0]
     l1, l2 = logits[:B], logits[B:]
 
@@ -132,8 +166,21 @@ def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, l
     else:
         L_bce = torch.zeros((), device=device)
 
-    loss = L_cl + lambda_t * L_pcl + args.alpha_fidelity * L_bce
-    return loss, dict(L_cl=float(L_cl), L_pcl=float(L_pcl), L_bce=float(L_bce))
+    # known-concept anchor: distil labelled concepts toward the frozen phase-1 CBL so the
+    # known concepts don't drift off their (frozen) prototypes -> keeps Old from collapsing.
+    if frozen_cbl is not None and mask_lab.any():
+        with torch.no_grad():
+            f_tar = frozen_cbl(feat)                 # phase-1 CBL output = fixed target
+        ft1, ft2 = f_tar[:B], f_tar[B:]
+        L_anchor = 0.5 * (((l1[mask_lab] - ft1[mask_lab]) ** 2).mean() +
+                          ((l2[mask_lab] - ft2[mask_lab]) ** 2).mean())
+    else:
+        L_anchor = torch.zeros((), device=device)
+
+    loss = (args.w_cl * L_cl + lambda_t * L_pcl + args.alpha_fidelity * L_bce
+            + args.anchor_known * L_anchor)
+    return loss, dict(L_cl=float(L_cl), L_pcl=float(L_pcl), L_bce=float(L_bce),
+                      L_anchor=float(L_anchor))
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +199,7 @@ def run_xgcd(args):
             f"(it saves cbl_stage1.pt + vocab.json into --cbl_dir).")
     vocab = load_vocabulary(vocab_path)
     args.num_concepts = len(vocab)
+
     logger.info(f"xGCD Stage 2: device={device}, C={args.num_concepts}, "
                 f"K^l={args.num_labeled_classes}, K^n(true)={args.num_unlabeled_classes}")
 
@@ -172,6 +220,8 @@ def run_xgcd(args):
     cbl_ckpt = os.path.join(args.cbl_dir, "cbl_stage1.pt")
     model.cbl.load_state_dict(torch.load(cbl_ckpt, map_location=device))
     logger.info(f"Loaded Stage-1 CBL from {cbl_ckpt}")
+
+
 
     wandb_run = init_wandb(args, stage="stage2")
 
@@ -197,26 +247,78 @@ def run_xgcd(args):
 
     state = None
     global_epoch = 0
+    prev_phase = None
+    frozen_lda = None          # known-class Gaussian snapshot (set once at start of phase 2)
+    frozen_cbl = None          # phase-1 CBL snapshot for the known-concept anchor
+    known_proj = None          # (UUt, W0_known, b0) for known-feature gradient protection
 
     for epoch in range(total_epochs):
         phase = 1 if epoch < args.warmup_epochs else 2
+
+        # blank separator only when the phase changes (baseline->P1, P1->P2)
+        if phase != prev_phase:
+            desc = "warm-up, known classes only" if phase == 1 else "joint: gate + DPMM"
+            logger.info("")
+            logger.info("_" * 70)
+            logger.info(f"PHASE {phase}  ({desc})")
+            logger.info("_" * 70)
+            prev_phase = phase
+
         # ---- atomic E-step refresh ----
         if phase == 1:
+            # respect --freeze_backbone in phase 1 too. Previously this always set
+            # requires_grad=True, so the last ViT block trained at full lambda during
+            # warm-up and L_PCL collapsed the concept space (within-class var -> 0).
+            for p in model.backbone.parameters():
+                p.requires_grad = not args.freeze_backbone
+                
             if state is None or epoch % args.refresh_period == 0:
                 state = compute_estep(model, lab_loader, None, phase=1, args=args, device=device)
-            lambda_t = 1.0
+            lambda_t = args.phase1_lambda
             loader = labelled_train
         else:
+            # freezing the backbone
+            for p in model.backbone.parameters():
+                p.requires_grad = not args.freeze_backbone
+
+            # snapshot the phase-1 CBL once, to anchor known concepts through phase 2
+            if args.anchor_known > 0 and frozen_cbl is None:
+                frozen_cbl = copy.deepcopy(model.cbl).to(device).eval()
+                for p in frozen_cbl.parameters():
+                    p.requires_grad = False
+                logger.info("snapshot phase-1 CBL for known-concept anchor (L_anchor)")
+
+            # snapshot the known-feature subspace once, to hard-protect known outputs
+            if args.protect_known_grad and known_proj is None:
+                feats_k, _, _ = extract_backbone_features(model.backbone, lab_loader, device)
+                U = _known_feature_basis(feats_k.to(device), args.protect_known_energy)  # [in, r]
+                if len(model.cbl.model) > 1:
+                    logger.warning("protect_known_grad exactly protects known only for num_hidden=0")
+                lin0 = model.cbl.model[0]
+                UUt = U @ U.t()                                       # [in, in]
+                b0 = lin0.bias.detach().clone() if lin0.bias is not None else None
+                known_proj = (UUt, (lin0.weight.detach() @ UUt).clone(), b0)
+                logger.info(f"protect-known: fixing {U.shape[1]}/{feats_k.shape[1]} known feature dirs")
+
             t = epoch - args.warmup_epochs
             if state is None or state.get("k_novel", -1) < 0 or t % args.refresh_period == 0 or state["assign_by_uq"] is None:
-                state = compute_estep(model, lab_loader, unlab_loader, phase=2, args=args, device=device)
+                state = compute_estep(model, lab_loader, unlab_loader, phase=2, args=args,
+                                      device=device, prev_state=state, frozen_lda=frozen_lda)
+                # snapshot the known Gaussian once, at the first phase-2 E-step, then reuse
+                # it so known prototypes + metric stay FIXED (only novel means update).
+                if args.freeze_known_protos and frozen_lda is None:
+                    frozen_lda = copy.deepcopy(state["lda"]).to("cpu")
+                    logger.info("froze known prototypes + Sigma (only novel means will update)")
                 last_eval = _eval_and_log(state, args, wandb_run, epoch, vocab) or last_eval
-            lambda_t = min(1.0, t / max(args.lambda_warmup, 1))
+        
+            lambda_t = min(args.lambda_max, t / max(args.lambda_warmup, 1))
             loader = merged_train
 
         # ---- M-step ----
         model.train()
-        agg = dict(L_cl=0.0, L_pcl=0.0, L_bce=0.0, loss=0.0)
+        if args.freeze_backbone:
+            model.backbone.eval()   # frozen backbone -> deterministic features (no DropPath)
+        agg = dict(L_cl=0.0, L_pcl=0.0, L_bce=0.0, L_anchor=0.0, loss=0.0)
         nb = 0
         for batch in loader:
             if phase == 1:
@@ -224,13 +326,17 @@ def run_xgcd(args):
                 mask_lab = torch.ones(images[0].shape[0])
             else:
                 images, labels, uq, mask_lab = batch
+
             loss, parts = mstep_loss(model, images, labels, uq, mask_lab, state,
-                                     lookup, pos_weight, lambda_t, args, device)
+                                     lookup, pos_weight, lambda_t, args, device,
+                                     frozen_cbl=frozen_cbl)
             optimizer.zero_grad()
             loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
+            if known_proj is not None:
+                _apply_known_protection(model.cbl, known_proj)   # snap known dirs back to phase-1
             for k in parts:
                 agg[k] += parts[k]
             agg["loss"] += float(loss)
@@ -241,7 +347,8 @@ def run_xgcd(args):
             agg[k] /= max(nb, 1)
         logger.info(f"[xGCD] epoch {epoch+1}/{total_epochs} (phase {phase}) "
                     f"loss={agg['loss']:.4f} L_cl={agg['L_cl']:.4f} L_pcl={agg['L_pcl']:.4f} "
-                    f"L_bce={agg['L_bce']:.4f} lambda={lambda_t:.2f} K^n={state.get('k_novel',0)}")
+                    f"L_bce={agg['L_bce']:.4f} L_anchor={agg['L_anchor']:.4f} "
+                    f"lambda={lambda_t:.2f} K^n={state.get('k_novel',0)}")
         # detailed, shareable summary block every 10 epochs (+ first & last)
         if (epoch + 1) % 10 == 0 or epoch == 0 or (epoch + 1) == total_epochs:
             _print_summary(epoch + 1, total_epochs, phase, agg, lambda_t, state, last_eval)
@@ -268,8 +375,6 @@ def run_xgcd(args):
 
 def _print_summary(epoch, total, phase, agg, lambda_t, state, last_eval, baseline=False, final=False):
     """One compact, greppable block with everything needed to diagnose a run."""
-    bar = "=" * 66
-    logger.info(bar)
     if baseline:
         logger.info(" xGCD epoch 0  [BASELINE — straight from Stage-1 CBL, no Stage-2 training]")
     else:
@@ -277,7 +382,8 @@ def _print_summary(epoch, total, phase, agg, lambda_t, state, last_eval, baselin
         logger.info(f" xGCD SUMMARY epoch {epoch}/{total}  [phase {phase}]{tag}")
         if agg is not None:
             logger.info(f"   losses : total={agg['loss']:.4f}  L_cl={agg['L_cl']:.4f}  "
-                        f"L_pcl={agg['L_pcl']:.4f}  L_bce={agg['L_bce']:.4f}  (lambda={lambda_t:.2f})")
+                        f"L_pcl={agg['L_pcl']:.4f}  L_bce={agg['L_bce']:.4f}  "
+                        f"L_anchor={agg.get('L_anchor', 0.0):.4f}  (lambda={lambda_t:.2f})")
     logger.info(f"   E-step : K^n={state.get('k_novel', 0)}  "
                 f"novel_pool={state.get('novel_pool', 0)} ({100 * state.get('novel_frac', 0.0):.1f}%)  "
                 f"cond(Sigma)={state.get('cond_sigma', 0.0):.1f}  logit_std={state.get('logit_std', 0.0):.2f}")
@@ -285,7 +391,6 @@ def _print_summary(epoch, total, phase, agg, lambda_t, state, last_eval, baselin
         logger.info(f"   eval   : All={last_eval['all_acc']:.4f}  Old={last_eval['old_acc']:.4f}  "
                     f"New={last_eval['new_acc']:.4f}  |  K^n_hat={last_eval['k_hat_novel']} "
                     f"(true {last_eval['k_novel_true']}, err {last_eval['k_novel_err']})")
-    logger.info(bar)
 
 
 def _eval_and_log(state, args, wandb_run, epoch, vocab, final=False):
@@ -335,24 +440,38 @@ def get_xgcd_parser():
     p.add_argument("--cbl_hidden_layers", type=int, default=0)
     p.add_argument("--pretrain", type=str, default="dino")
     p.add_argument("--pretrain_path", type=str, default=None)
+    p.add_argument("--freeze_backbone", type=str2bool, default=False)
+    p.add_argument("--freeze_known_protos", type=str2bool, default=False,
+                   help="freeze known means + Sigma at the start of phase 2 (only novel means update)")
     # schedule
     p.add_argument("--warmup_epochs", type=int, default=20, help="Phase 1 (T0) epochs")
     p.add_argument("--epochs", type=int, default=200, help="Phase 2 joint epochs")
     p.add_argument("--refresh_period", type=int, default=5, help="E-step refresh period R")
-    p.add_argument("--lambda_warmup", type=int, default=20, help="lambda(t)=min(1,t/T)")
+    p.add_argument("--lambda_warmup", type=int, default=20, help="lambda(t)=lambda_max*min(1,t/T)")
+    p.add_argument("--lambda_max", type=float, default=0.1, help="phase-2 L_PCL ceiling (keeps it gentle so it doesn't slowly collapse the concept space)")
+    p.add_argument("--phase1_lambda", type=float, default=1.0, help="L_PCL weight during phase 1 (lower to avoid warm-up collapse)")
     # losses / metric
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--w_cl", type=float, default=1.0, help="weight of L_CL (view-contrastive); lower to reduce logit_std inflation")
     p.add_argument("--alpha_fidelity", type=float, default=0.1)
+    p.add_argument("--anchor_known", type=float, default=0.0,
+                   help="weight of L_anchor: distil labelled concepts toward the phase-1 CBL (0=off; try ~1.0)")
+    p.add_argument("--protect_known_grad", type=str2bool, default=False,
+                   help="hard-freeze known-feature directions in the CBL weight (projection); alternative to --anchor_known")
+    p.add_argument("--protect_known_energy", type=float, default=0.99,
+                   help="fraction of known-feature variance to protect (higher = more dirs frozen, less room for novel)")
     p.add_argument("--pos_weight_clip", type=float, default=50.0)
     # E-step hyperparameters
-    p.add_argument("--novelty_alpha", type=float, default=0.05)
+    p.add_argument("--novelty_alpha", type=float, default=0.2)
     p.add_argument("--lda_ridge_gamma", type=float, default=0.1)
-    p.add_argument("--dpmm_alpha", type=float, default=1.0)
+    p.add_argument("--dpmm_alpha", type=float, default=0.5)
     p.add_argument("--dpmm_beta", type=float, default=1.0)
     p.add_argument("--dpmm_sweeps", type=int, default=30)
     p.add_argument("--dpmm_max_points", type=int, default=8000)
     p.add_argument("--dpmm_min_cluster_size", type=int, default=10)
     p.add_argument("--dpmm_min_pool", type=int, default=10)
+    p.add_argument("--dpmm_warm_start", type=str2bool, default=True,
+                   help="seed each DPMM refresh from the previous clusters (stops K^n churn)")
     # optim
     p.add_argument("--lr", type=float, default=0.1)
     p.add_argument("--cbl_lr_divisor", type=float, default=100.0, help="CBL LR = lr / this")

@@ -7,10 +7,14 @@ Reused across stages so no stage re-implements the forward loop:
 Both accept loaders whose batches start with (img, label, uq_idx, ...) — the extra
 `mask_lab` field emitted by MergedDataset is preserved when present.
 """
+import sys
 from typing import Tuple
 
 import torch
 from tqdm import tqdm
+
+# only draw progress bars on an interactive terminal; keeps SLURM/log files clean
+_TQDM_OFF = not sys.stderr.isatty()
 
 
 def _unpack(batch):
@@ -24,7 +28,7 @@ def extract_backbone_features(backbone, loader, device) -> Tuple[torch.Tensor, t
     """Return (feats [N, 768], labels [N], uq_idxs [N]) on CPU."""
     backbone.eval()
     feats, labels, uqs = [], [], []
-    for batch in tqdm(loader, desc="extract features", leave=False):
+    for batch in tqdm(loader, desc="extract features", leave=False, disable=_TQDM_OFF):
         img, label, uq, _ = _unpack(batch)
         f = backbone(img.to(device))
         feats.append(f.detach().cpu())
@@ -42,7 +46,7 @@ def extract_concept_logits(model, loader, device):
     model.eval()
     logits, labels, uqs, masks = [], [], [], []
     have_mask = True
-    for batch in tqdm(loader, desc="extract logits", leave=False):
+    for batch in tqdm(loader, desc="extract logits", leave=False, disable=_TQDM_OFF):
         img, label, uq, mask = _unpack(batch)
         ell = model(img.to(device))
         logits.append(ell.detach().cpu())

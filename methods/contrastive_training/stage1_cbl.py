@@ -47,7 +47,7 @@ def init_wandb(args, stage="stage1"):
     run = wandb.init(
         entity=args.wandb_entity,
         project=args.wandb_project,
-        name=f"{stage}-{args.dataset_name}-{args.exp_name}",
+        name=f"mahsa_{stage}-{args.dataset_name}-{args.exp_name}",
         group=args.exp_name,
         config=vars(args),
     )
