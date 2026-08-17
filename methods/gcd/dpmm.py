@@ -48,7 +48,10 @@ class DPMM:
 
     # ------------------------------------------------------------------ fit
     @torch.no_grad()
-    def fit(self, logits_pool: torch.Tensor, lda, m0: Optional[torch.Tensor] = None) -> DPMMResult:
+    def fit(self, logits_pool: torch.Tensor, lda, m0: Optional[torch.Tensor] = None,
+            init_z: Optional[torch.Tensor] = None) -> DPMMResult:
+        # init_z: optional [N_full] warm-start assignment (novel-cluster id per pool point,
+        # -1 = no prior cluster). None -> the original cold CRP init (unchanged behaviour).
         g = torch.Generator(device="cpu").manual_seed(self.seed)
         X_full = logits_pool.float().cpu()
         N_full, C = X_full.shape
@@ -114,10 +117,29 @@ class DPMM:
                 sums.append(torch.zeros(C))
             add(i, choice)
 
-        # ---- sequential CRP init (one pass from empty) ----
-        order = torch.randperm(N, generator=g)
-        for i in order.tolist():
-            gibbs_step(i)
+        # ---- init: warm-start from previous clusters, else cold CRP ----
+        if init_z is not None:
+            # seed the sampler with last E-step's clusters so it *refines* instead of
+            # rebuilding from scratch (kills the K^n churn / prototype teleporting).
+            iz = init_z[idx] if (self.max_points and N_full > self.max_points) else init_z
+            iz = iz.long().cpu()
+            present = sorted({int(c) for c in iz.tolist() if c >= 0})   # occupied prior clusters
+            remap = {c: j for j, c in enumerate(present)}               # -> contiguous ids
+            for _ in present:
+                counts.append(0)
+                sums.append(torch.zeros(C))
+            for i in range(N):                       # place points with a prior cluster
+                c = int(iz[i])
+                if c >= 0:
+                    add(i, remap[c])
+            for i in range(N):                       # new points (-1) get one Gibbs placement
+                if int(z[i]) < 0:
+                    gibbs_step(i)
+        else:
+            # ---- sequential CRP init (one pass from empty) [cold-start fallback] ----
+            order = torch.randperm(N, generator=g)
+            for i in order.tolist():
+                gibbs_step(i)
 
         # ---- Gibbs sweeps to convergence ----
         stable = 0
