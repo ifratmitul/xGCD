@@ -64,16 +64,16 @@ spec:
                 STAGE1_EPOCHS=50; WARMUP=5; STAGE2_EPOCHS=30; REFRESH=2
             fi
 
-            # ---- Run 2 Stage-2 hyperparameters (fixes 1-4: empirical tau, live L_CL,
-            #      anti-contamination PCL) on top of the frozen-backbone control ----
+            # ---- ABLATION: fix #2 + #3 (empirical gate + live L_CL). #1 still OFF ----
             FREEZE_BACKBONE="True"
             CBL_LR="1e-3"          # CBL LR when frozen (0.1 diverges!)
             ALPHA_FIDELITY="0.5"
             NOVELTY_ALPHA="0.2"
-            TAU_MODE="empirical"   # data-calibrated gate threshold (vs chi2)
-            PCL_KNOWN_UNLAB_W="0.0"  # drop unlabelled-assigned-known from L_PCL (anti-forgetting)
+            TAU_MODE="empirical"     # fix #2 ON  (data-calibrated gate)
+            PCL_KNOWN_UNLAB_W="1.0"  # fix #1 OFF (contaminating PCL, pre-fix)
+            NORM_D2_BY_C="True"      # fix #3 ON  (live L_CL/L_PCL, d^2/C)
             GRAD_CLIP="1.0"        # safety net against blow-ups
-            S2_EXP="stage2_fixes_test"
+            S2_EXP="stage2_abl_empirical_cl"
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -130,6 +130,7 @@ spec:
                 --tau_mode "$TAU_MODE" \
                 --alpha_fidelity "$ALPHA_FIDELITY" \
                 --pcl_known_unlab_weight "$PCL_KNOWN_UNLAB_W" \
+                --norm_d2_by_c "$NORM_D2_BY_C" \
                 --grad_clip "$GRAD_CLIP" \
                 --lr 0.1 \
                 --cbl_lr_divisor 100 \

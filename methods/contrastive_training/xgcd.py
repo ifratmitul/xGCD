@@ -111,7 +111,9 @@ def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, l
     z1, z2, protos_w = lda.whiten(l1), lda.whiten(l2), lda.whiten(protos)
 
     # L_CL (Eq 13) — whitened Euclidean contrastive between the two views
-    L_cl = mahalanobis_contrastive_loss(z1, z2, precision=None, temperature=args.temperature)
+    nc = getattr(args, "norm_d2_by_c", True)
+    L_cl = mahalanobis_contrastive_loss(z1, z2, precision=None, temperature=args.temperature,
+                                        normalize_by_c=nc)
 
     # per-image prototype target: GT class if labelled, cached E-step assignment if not
     labels = labels.to(device).long()
@@ -139,8 +141,8 @@ def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, l
         weights = w
 
     # L_PCL (Eq 14) — averaged over both views against the same per-image prototype
-    L_pcl = 0.5 * (prototypical_loss(z1, protos_w, targets, None, args.temperature, weights) +
-                   prototypical_loss(z2, protos_w, targets, None, args.temperature, weights))
+    L_pcl = 0.5 * (prototypical_loss(z1, protos_w, targets, None, args.temperature, weights, nc) +
+                   prototypical_loss(z2, protos_w, targets, None, args.temperature, weights, nc))
 
     # concept-fidelity BCE (Eq 16) — labelled images only, averaged over views
     if mask_lab.any():
@@ -400,6 +402,8 @@ def get_xgcd_parser():
                         "cluster (0 = drop them; anti-contamination for the forgetting issue)")
     # E-step hyperparameters
     p.add_argument("--novelty_alpha", type=float, default=0.05)
+    p.add_argument("--norm_d2_by_c", type=str2bool, default=True,
+                   help="normalize d^2 by C in L_CL/L_PCL softmax (fix #3). False = pre-fix behaviour")
     p.add_argument("--tau_mode", type=str, default="empirical", choices=["empirical", "chi2"],
                    help="novelty threshold: empirical (labelled quantile) or chi^2")
     p.add_argument("--lda_ridge_gamma", type=float, default=0.1)

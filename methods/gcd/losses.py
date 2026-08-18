@@ -32,16 +32,17 @@ def mahalanobis_sq_pairs(A: torch.Tensor, B: torch.Tensor,
 
 def mahalanobis_contrastive_loss(z: torch.Tensor, z_prime: torch.Tensor,
                                  precision: torch.Tensor = None, temperature: float = 1.0,
-                                 symmetric: bool = True) -> torch.Tensor:
+                                 symmetric: bool = True, normalize_by_c: bool = True) -> torch.Tensor:
     """L_CL (Eq 13): pull the two views of an image together, push different images
     apart, under the Mahalanobis metric. z, z_prime: [B, C] logits of the two views.
     Pass whitened logits with precision=None for the fast Euclidean path.
 
-    d^2 is normalised by C: in whitened space d^2 ~ O(C), so without this the softmax
-    logits are ~O(C)=O(70) and saturate to argmax -> L_CL dies (~0 gradient)."""
+    normalize_by_c=True divides d^2 by C: in whitened space d^2 ~ O(C), so without it the
+    softmax logits are ~O(C)=O(70) and saturate to argmax -> L_CL dies (~0 gradient).
+    Set False to reproduce the pre-fix behaviour (for ablations)."""
     d2 = mahalanobis_sq_pairs(z, z_prime, precision)          # [B, B]
-    C = z.size(1)
-    logits = -0.5 * d2 / (C * temperature)
+    denom = (z.size(1) if normalize_by_c else 1.0) * temperature
+    logits = -0.5 * d2 / denom
     labels = torch.arange(z.size(0), device=z.device)
     loss = F.cross_entropy(logits, labels)
     if symmetric:
@@ -51,18 +52,18 @@ def mahalanobis_contrastive_loss(z: torch.Tensor, z_prime: torch.Tensor,
 
 def prototypical_loss(z: torch.Tensor, prototypes: torch.Tensor, assignments: torch.Tensor,
                       precision: torch.Tensor = None, temperature: float = 1.0,
-                      weights: torch.Tensor = None) -> torch.Tensor:
+                      weights: torch.Tensor = None, normalize_by_c: bool = True) -> torch.Tensor:
     """L_PCL (Eq 14): minimise the Mahalanobis NLL of each logit under its assigned
     Gaussian component — a softmax over prototypes.
 
     z:[B,C], prototypes:[K,C] (fixed mu_k), assignments:[B] (target component id).
     weights:[B] optional per-sample weight (e.g. down-weight unlabelled-assigned-known
-    samples to stop them contaminating the known prototypes). d^2 normalised by C as above.
+    samples to stop them contaminating the known prototypes). normalize_by_c: see L_CL.
     assignments==-1 are ignored (unassigned samples still contribute to L_CL).
     """
     d2 = mahalanobis_sq_pairs(z, prototypes, precision)       # [B, K]
-    C = z.size(1)
-    logits = -0.5 * d2 / (C * temperature)
+    denom = (z.size(1) if normalize_by_c else 1.0) * temperature
+    logits = -0.5 * d2 / denom
     valid = assignments != -1
     if int(valid.sum()) == 0:
         return logits.sum() * 0.0   # all ignored -> 0 loss (keeps graph connected)
