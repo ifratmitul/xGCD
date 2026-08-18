@@ -3,7 +3,8 @@
 All similarities use the Mahalanobis metric induced by the shared LDA covariance,
     d^2_Sigma(a, b) = (a - b)^T Sigma^{-1} (a - b),                    (Eq 12)
 so representation learning shares the geometry of the E-step's Gaussian mixture.
-Sigma^{-1} (`precision`) is taken from the E-step and held FIXED here — gradients flow
+Sigma^{-1} (`precision`) is taken from the 
+E-step and held FIXED here — gradients flow
 only through the concept logits (the representation), never through the metric.
 
   L_CL  : self-supervised contrastive over two augmented views       (Eq 13)
@@ -31,12 +32,17 @@ def mahalanobis_sq_pairs(A: torch.Tensor, B: torch.Tensor,
 
 def mahalanobis_contrastive_loss(z: torch.Tensor, z_prime: torch.Tensor,
                                  precision: torch.Tensor = None, temperature: float = 1.0,
-                                 symmetric: bool = True) -> torch.Tensor:
+                                 symmetric: bool = True, normalize_by_c: bool = True) -> torch.Tensor:
     """L_CL (Eq 13): pull the two views of an image together, push different images
     apart, under the Mahalanobis metric. z, z_prime: [B, C] logits of the two views.
-    Pass whitened logits with precision=None for the fast Euclidean path."""
+    Pass whitened logits with precision=None for the fast Euclidean path.
+
+    normalize_by_c=True divides d^2 by C: in whitened space d^2 ~ O(C), so without it the
+    softmax logits are ~O(C)=O(70) and saturate to argmax -> L_CL dies (~0 gradient).
+    Set False to reproduce the pre-fix behaviour (for ablations)."""
     d2 = mahalanobis_sq_pairs(z, z_prime, precision)          # [B, B]
-    logits = -0.5 * d2 / temperature
+    denom = (z.size(1) if normalize_by_c else 1.0) * temperature
+    logits = -0.5 * d2 / denom
     labels = torch.arange(z.size(0), device=z.device)
     loss = F.cross_entropy(logits, labels)
     if symmetric:
@@ -45,19 +51,30 @@ def mahalanobis_contrastive_loss(z: torch.Tensor, z_prime: torch.Tensor,
 
 
 def prototypical_loss(z: torch.Tensor, prototypes: torch.Tensor, assignments: torch.Tensor,
-                      precision: torch.Tensor = None, temperature: float = 1.0) -> torch.Tensor:
+                      precision: torch.Tensor = None, temperature: float = 1.0,
+                      weights: torch.Tensor = None, normalize_by_c: bool = True) -> torch.Tensor:
     """L_PCL (Eq 14): minimise the Mahalanobis NLL of each logit under its assigned
     Gaussian component — a softmax over prototypes.
 
     z:[B,C], prototypes:[K,C] (fixed mu_k), assignments:[B] (target component id).
+    weights:[B] optional per-sample weight (e.g. down-weight unlabelled-assigned-known
+    samples to stop them contaminating the known prototypes). normalize_by_c: see L_CL.
+    assignments==-1 are ignored (unassigned samples still contribute to L_CL).
     """
     d2 = mahalanobis_sq_pairs(z, prototypes, precision)       # [B, K]
-    logits = -0.5 * d2 / temperature
-    # ignore_index=-1: unlabelled samples the E-step left unassigned (novel pool too
-    # small / rejected by the gate) contribute to L_CL but get no prototype pull here.
-    if (assignments != -1).sum() == 0:
+    denom = (z.size(1) if normalize_by_c else 1.0) * temperature
+    logits = -0.5 * d2 / denom
+    valid = assignments != -1
+    if int(valid.sum()) == 0:
         return logits.sum() * 0.0   # all ignored -> 0 loss (keeps graph connected)
-    return F.cross_entropy(logits, assignments, ignore_index=-1)
+    per = F.cross_entropy(logits, assignments.clamp(min=0), reduction="none")  # [B]
+    mask = valid.float()
+    if weights is not None:
+        mask = mask * weights
+    denom = mask.sum()
+    if denom == 0:
+        return logits.sum() * 0.0
+    return (per * mask).sum() / denom
 
 
 def fidelity_bce(concept_logits: torch.Tensor, targets: torch.Tensor,

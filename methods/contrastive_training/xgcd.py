@@ -29,7 +29,8 @@ from methods.contrastive_training.extract import extract_concept_logits, extract
 from methods.contrastive_training.stage1_cbl import get_device, init_wandb
 from methods.gcd.estep import run_estep
 from methods.gcd.lda_gaussian import LDAGaussian
-from methods.gcd.losses import mahalanobis_contrastive_loss, prototypical_loss, fidelity_bce
+from methods.gcd.losses import (mahalanobis_contrastive_loss, prototypical_loss,
+                                 fidelity_bce, mahalanobis_sq_pairs)
 from methods.gcd.eval_gcd import evaluate_gcd, explain_prototype
 from models.model_factory import build_concept_model
 from project_utils.general_utils import str2bool
@@ -84,7 +85,10 @@ def compute_estep(model, lab_loader, unlab_loader, phase, args, device, prev_sta
     if (getattr(args, "dpmm_warm_start", True) and prev_state is not None
             and prev_state.get("assign_by_uq") is not None):
         prev_assign_unlab = prev_state["assign_by_uq"][unlab_uq.long().to(device)].cpu()
+    # unlab_labels are GT — passed for the gate-distance DIAGNOSTIC only (logging), never
+    # used to make a training decision inside run_estep, so no leakage.
     res = run_estep(lab_logits, lab_labels, unlab_logits, args,
+                    unlab_labels=unlab_labels,
                     prev_assign_unlab=prev_assign_unlab, frozen_lda=frozen_lda)
 
     max_uq = int(max(int(lab_uq.max()), int(unlab_uq.max()))) + 1
@@ -97,7 +101,10 @@ def compute_estep(model, lab_loader, unlab_loader, phase, args, device, prev_sta
                 novel_pool=int(len(res.novel_idx)), tau=res.tau,
                 cond_sigma=float(torch.linalg.cond(res.lda.cov)),
                 novel_frac=float(len(res.novel_idx)) / max(len(unlab_logits), 1),
-                logit_std=float(unlab_logits.std()))
+                logit_std=float(unlab_logits.std()),
+                tau_emp=res.tau_emp, tau_chi2=res.tau_chi2,
+                tau_ratio=(res.tau_emp / res.tau_chi2 if res.tau_chi2 else 0.0),
+                lab_reject=res.lab_reject, novel_recall=res.novel_recall)
 
 
 # --------------------------------------------------------------------------- #
@@ -139,7 +146,9 @@ def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, l
     z1, z2, protos_w = lda.whiten(l1), lda.whiten(l2), lda.whiten(protos)
 
     # L_CL (Eq 13) — whitened Euclidean contrastive between the two views
-    L_cl = mahalanobis_contrastive_loss(z1, z2, precision=None, temperature=args.temperature)
+    nc = getattr(args, "norm_d2_by_c", True)
+    L_cl = mahalanobis_contrastive_loss(z1, z2, precision=None, temperature=args.temperature,
+                                        normalize_by_c=nc)
 
     # per-image prototype target: GT class if labelled, cached E-step assignment if not
     labels = labels.to(device).long()
@@ -154,9 +163,21 @@ def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, l
     K = protos.shape[0]
     targets = torch.where((targets >= 0) & (targets < K), targets, torch.full_like(targets, -1))
 
+    # anti-contamination weight: down-weight (default 0 = drop) L_PCL for unlabelled
+    # samples the gate assigned to a KNOWN cluster. The gate misroutes many novel samples
+    # as known; pulling them onto known prototypes corrupts them (catastrophic forgetting).
+    # Known prototypes stay defined by labelled data; unlabelled drive L_PCL only via novel.
+    weights = None
+    if state["assign_by_uq"] is not None:
+        k_known = state.get("k_known", 0)
+        w = torch.ones(B, device=device)
+        unlab_known = (~mask_lab) & (targets >= 0) & (targets < k_known)
+        w[unlab_known] = getattr(args, "pcl_known_unlab_weight", 0.0)
+        weights = w
+
     # L_PCL (Eq 14) — averaged over both views against the same per-image prototype
-    L_pcl = 0.5 * (prototypical_loss(z1, protos_w, targets, None, args.temperature) +
-                   prototypical_loss(z2, protos_w, targets, None, args.temperature))
+    L_pcl = 0.5 * (prototypical_loss(z1, protos_w, targets, None, args.temperature, weights, nc) +
+                   prototypical_loss(z2, protos_w, targets, None, args.temperature, weights, nc))
 
     # concept-fidelity BCE (Eq 16) — labelled images only, averaged over views
     if mask_lab.any():
@@ -179,8 +200,14 @@ def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, l
 
     loss = (args.w_cl * L_cl + lambda_t * L_pcl + args.alpha_fidelity * L_bce
             + args.anchor_known * L_anchor)
-    return loss, dict(L_cl=float(L_cl), L_pcl=float(L_pcl), L_bce=float(L_bce),
-                      L_anchor=float(L_anchor))
+    # [cl-scale] whitened-distance scale: pos = matching views (diag), neg = off-diagonal.
+    with torch.no_grad():
+        d2 = mahalanobis_sq_pairs(z1, z2, None)
+        pos_d2 = float(d2.diag().mean())
+        neg_d2 = float(d2.mean())
+    parts = dict(L_cl=float(L_cl), L_pcl=float(L_pcl), L_bce=float(L_bce),
+                 L_anchor=float(L_anchor), pos_d2=pos_d2, neg_d2=neg_d2)
+    return loss, parts
 
 
 # --------------------------------------------------------------------------- #
@@ -234,8 +261,17 @@ def run_xgcd(args):
                               num_workers=args.num_workers, drop_last=True)
 
     total_epochs = args.warmup_epochs + args.epochs
-    optimizer = torch.optim.SGD(model.param_groups(args.lr, args.lr / args.cbl_lr_divisor),
-                                momentum=0.9, weight_decay=args.weight_decay)
+    if args.freeze_backbone:
+        # anti-forgetting: keep the DINO features fixed, adapt only the concept layer.
+        # The CBL is a sensitive linear layer (Stage 1 trained it at 1e-4) -> use the
+        # small, explicit --cbl_lr, NOT the backbone lr (0.1 diverges immediately).
+        for p in model.backbone.parameters():
+            p.requires_grad_(False)
+        param_groups = [{"params": list(model.cbl.parameters()), "lr": args.cbl_lr}]
+        logger.info(f"Backbone FROZEN — training CBL only at lr={args.cbl_lr}")
+    else:
+        param_groups = model.param_groups(args.lr, args.lr / args.cbl_lr_divisor)
+    optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
 
     # baseline eval (epoch 0): the starting point straight from the Stage-1 CBL, before
@@ -309,8 +345,8 @@ def run_xgcd(args):
                 if args.freeze_known_protos and frozen_lda is None:
                     frozen_lda = copy.deepcopy(state["lda"]).to("cpu")
                     logger.info("froze known prototypes + Sigma (only novel means will update)")
-                last_eval = _eval_and_log(state, args, wandb_run, epoch, vocab) or last_eval
-        
+                last_eval = _eval_and_log(state, args, wandb_run, epoch + 1, vocab) or last_eval
+
             lambda_t = min(args.lambda_max, t / max(args.lambda_warmup, 1))
             loader = merged_train
 
@@ -318,7 +354,8 @@ def run_xgcd(args):
         model.train()
         if args.freeze_backbone:
             model.backbone.eval()   # frozen backbone -> deterministic features (no DropPath)
-        agg = dict(L_cl=0.0, L_pcl=0.0, L_bce=0.0, L_anchor=0.0, loss=0.0)
+        agg = dict(L_cl=0.0, L_pcl=0.0, L_bce=0.0, L_anchor=0.0,
+                   pos_d2=0.0, neg_d2=0.0, loss=0.0)
         nb = 0
         for batch in loader:
             if phase == 1:
@@ -330,6 +367,10 @@ def run_xgcd(args):
             loss, parts = mstep_loss(model, images, labels, uq, mask_lab, state,
                                      lookup, pos_weight, lambda_t, args, device,
                                      frozen_cbl=frozen_cbl)
+            if not torch.isfinite(loss):
+                logger.error(f"[xGCD] non-finite loss at epoch {epoch+1} — diverged. "
+                             f"Lower --cbl_lr / --lr or set --grad_clip.")
+                raise RuntimeError("Stage 2 diverged (non-finite loss).")
             optimizer.zero_grad()
             loss.backward()
             if args.grad_clip > 0:
@@ -353,7 +394,10 @@ def run_xgcd(args):
         if (epoch + 1) % 10 == 0 or epoch == 0 or (epoch + 1) == total_epochs:
             _print_summary(epoch + 1, total_epochs, phase, agg, lambda_t, state, last_eval)
         if wandb_run is not None:
-            wandb_run.log({f"stage2/{k}": v for k, v in agg.items()} |
+            gate = {f"gate/{k}": state.get(k, 0.0) for k in
+                    ("tau_emp", "tau_chi2", "tau_ratio", "lab_reject", "novel_recall")
+                    if state.get(k) is not None}
+            wandb_run.log({f"stage2/{k}": v for k, v in agg.items()} | gate |
                           {"stage2/phase": phase, "stage2/lambda": lambda_t,
                            "stage2/k_novel": state.get("k_novel", 0),
                            "stage2/novel_pool": state.get("novel_pool", 0),
@@ -384,9 +428,16 @@ def _print_summary(epoch, total, phase, agg, lambda_t, state, last_eval, baselin
             logger.info(f"   losses : total={agg['loss']:.4f}  L_cl={agg['L_cl']:.4f}  "
                         f"L_pcl={agg['L_pcl']:.4f}  L_bce={agg['L_bce']:.4f}  "
                         f"L_anchor={agg.get('L_anchor', 0.0):.4f}  (lambda={lambda_t:.2f})")
+            logger.info(f"   cl-scale: pos_d2={agg.get('pos_d2', 0.0):.1f}  "
+                        f"neg_d2={agg.get('neg_d2', 0.0):.1f}  (want pos << neg for a live L_CL)")
     logger.info(f"   E-step : K^n={state.get('k_novel', 0)}  "
                 f"novel_pool={state.get('novel_pool', 0)} ({100 * state.get('novel_frac', 0.0):.1f}%)  "
                 f"cond(Sigma)={state.get('cond_sigma', 0.0):.1f}  logit_std={state.get('logit_std', 0.0):.2f}")
+    if state.get("novel_recall") is not None:
+        logger.info(f"   gate   : tau_emp={state.get('tau_emp',0):.1f} "
+                    f"tau_ratio={state.get('tau_ratio',0):.2f} "
+                    f"lab_reject={state.get('lab_reject',0):.3f} "
+                    f"novel_recall={state.get('novel_recall',0):.3f}")
     if last_eval:
         logger.info(f"   eval   : All={last_eval['all_acc']:.4f}  Old={last_eval['old_acc']:.4f}  "
                     f"New={last_eval['new_acc']:.4f}  |  K^n_hat={last_eval['k_hat_novel']} "
@@ -451,7 +502,8 @@ def get_xgcd_parser():
     p.add_argument("--lambda_max", type=float, default=0.1, help="phase-2 L_PCL ceiling (keeps it gentle so it doesn't slowly collapse the concept space)")
     p.add_argument("--phase1_lambda", type=float, default=1.0, help="L_PCL weight during phase 1 (lower to avoid warm-up collapse)")
     # losses / metric
-    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--temperature", type=float, default=1.0,
+                   help="softmax temperature; d^2 is already normalised by C in the losses")
     p.add_argument("--w_cl", type=float, default=1.0, help="weight of L_CL (view-contrastive); lower to reduce logit_std inflation")
     p.add_argument("--alpha_fidelity", type=float, default=0.1)
     p.add_argument("--anchor_known", type=float, default=0.0,
@@ -461,8 +513,15 @@ def get_xgcd_parser():
     p.add_argument("--protect_known_energy", type=float, default=0.99,
                    help="fraction of known-feature variance to protect (higher = more dirs frozen, less room for novel)")
     p.add_argument("--pos_weight_clip", type=float, default=50.0)
+    p.add_argument("--pcl_known_unlab_weight", type=float, default=0.0,
+                   help="L_PCL weight for unlabelled samples the gate assigned to a KNOWN "
+                        "cluster (0 = drop them; anti-contamination for the forgetting issue)")
     # E-step hyperparameters
     p.add_argument("--novelty_alpha", type=float, default=0.2)
+    p.add_argument("--norm_d2_by_c", type=str2bool, default=True,
+                   help="normalize d^2 by C in L_CL/L_PCL softmax (fix #3). False = pre-fix behaviour")
+    p.add_argument("--tau_mode", type=str, default="empirical", choices=["empirical", "chi2"],
+                   help="novelty threshold: empirical (labelled quantile) or chi^2")
     p.add_argument("--lda_ridge_gamma", type=float, default=0.1)
     p.add_argument("--dpmm_alpha", type=float, default=0.5)
     p.add_argument("--dpmm_beta", type=float, default=1.0)
@@ -474,7 +533,11 @@ def get_xgcd_parser():
                    help="seed each DPMM refresh from the previous clusters (stops K^n churn)")
     # optim
     p.add_argument("--lr", type=float, default=0.1)
-    p.add_argument("--cbl_lr_divisor", type=float, default=100.0, help="CBL LR = lr / this")
+    p.add_argument("--cbl_lr_divisor", type=float, default=100.0, help="CBL LR = lr / this (non-frozen)")
+    p.add_argument("--cbl_lr", type=float, default=1e-3,
+                   help="explicit CBL LR used when --freeze_backbone (0.1 diverges; 1e-3 is safe)")
+    p.add_argument("--freeze_backbone", type=str2bool, default=False,
+                   help="freeze DINO backbone, train only the CBL at --cbl_lr (anti-forgetting)")
     p.add_argument("--weight_decay", type=float, default=5e-5)
     p.add_argument("--grad_clip", type=float, default=0.0)
     # io

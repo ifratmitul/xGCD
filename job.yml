@@ -56,12 +56,24 @@ spec:
             export WANDB_DIR="logs"   # offline run data under logs/wandb/
 
             # Set SMOKE=1 in the job for a fast integration run.
+            # RUN 1 = anti-forgetting experiment: short schedule to iterate fast (~3h).
             SMOKE="${SMOKE:-0}"
             if [ "$SMOKE" = "1" ]; then
                 STAGE1_EPOCHS=2; WARMUP=2; STAGE2_EPOCHS=4; REFRESH=2
             else
-                STAGE1_EPOCHS=50; WARMUP=20; STAGE2_EPOCHS=200; REFRESH=5
+                STAGE1_EPOCHS=50; WARMUP=5; STAGE2_EPOCHS=30; REFRESH=2
             fi
+
+            # ---- ABLATION: fix #2 + #3 (empirical gate + live L_CL). #1 still OFF ----
+            FREEZE_BACKBONE="True"
+            CBL_LR="1e-3"          # CBL LR when frozen (0.1 diverges!)
+            ALPHA_FIDELITY="0.5"
+            NOVELTY_ALPHA="0.2"
+            TAU_MODE="empirical"     # fix #2 ON  (data-calibrated gate)
+            PCL_KNOWN_UNLAB_W="1.0"  # fix #1 OFF (contaminating PCL, pre-fix)
+            NORM_D2_BY_C="True"      # fix #3 ON  (live L_CL/L_PCL, d^2/C)
+            GRAD_CLIP="1.0"        # safety net against blow-ups
+            S2_EXP="stage2_abl_empirical_cl"
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -98,9 +110,10 @@ spec:
             # ============================================================
             # xGCD — Stage 2: joint novel-class discovery + GCD
             # ============================================================
-            S2_OUT="exp/stage2_xgcd_${DATASET}"
+            S2_OUT="exp/${S2_EXP}"
             echo "=========================================="
-            echo "Stage 2: xGCD | warmup=$WARMUP joint_epochs=$STAGE2_EPOCHS refresh=$REFRESH"
+            echo "Stage 2 (Run 1): xGCD | warmup=$WARMUP joint=$STAGE2_EPOCHS refresh=$REFRESH"
+            echo "  freeze_backbone=$FREEZE_BACKBONE alpha_fidelity=$ALPHA_FIDELITY novelty_alpha=$NOVELTY_ALPHA"
             echo "=========================================="
             python -m methods.contrastive_training.xgcd \
                 --dataset_name "$DATASET" \
@@ -111,13 +124,19 @@ spec:
                 --epochs "$STAGE2_EPOCHS" \
                 --refresh_period "$REFRESH" \
                 --lambda_warmup 20 \
-                --novelty_alpha 0.05 \
-                --alpha_fidelity 0.1 \
+                --freeze_backbone "$FREEZE_BACKBONE" \
+                --cbl_lr "$CBL_LR" \
+                --novelty_alpha "$NOVELTY_ALPHA" \
+                --tau_mode "$TAU_MODE" \
+                --alpha_fidelity "$ALPHA_FIDELITY" \
+                --pcl_known_unlab_weight "$PCL_KNOWN_UNLAB_W" \
+                --norm_d2_by_c "$NORM_D2_BY_C" \
+                --grad_clip "$GRAD_CLIP" \
                 --lr 0.1 \
                 --cbl_lr_divisor 100 \
                 --batch_size 128 \
                 --num_workers 4 \
-                --exp_name "stage2_xgcd_${DATASET}" \
+                --exp_name "$S2_EXP" \
                 --use_wandb True \
                 --wandb_project "$WANDB_PROJECT" \
                 --wandb_entity "$WANDB_ENTITY"
