@@ -7,7 +7,7 @@
 #SBATCH --mem=128gb
 #SBATCH --time=200:00:00
 #SBATCH --gres=gpu:a100:1
-#SBATCH --output=%j_XGCD_FRB_Ph_1-2-PCL_lr_0.1-max_0.3-dpmm_warm_start-alpha_fidelity_1-w_cl_0.5.log
+#SBATCH --output=%j_XGCD_FRB_Ph_1-2-PCL_lr_0.1-max_0.5-dpmm_warm_start-phase1_lambda_0.5-anchor_known_1-freeze_known_protos.log
 
 echo "====================================================="
 pwd; hostname; date
@@ -48,7 +48,7 @@ SMOKE=2
 if [ "$SMOKE" = "1" ]; then
     STAGE1_EPOCHS=50; WARMUP=4; STAGE2_EPOCHS=4; REFRESH=2
 else
-    STAGE1_EPOCHS=0; WARMUP=5; STAGE2_EPOCHS=200; REFRESH=5
+    STAGE1_EPOCHS=0; WARMUP=5; STAGE2_EPOCHS=70; REFRESH=5
 fi
 
 CBL_OUT="exp/${EXP_NAME}"
@@ -84,24 +84,25 @@ apptainer exec --nv "$CONTAINER" \
     --refresh_period "$REFRESH" \
     --lambda_warmup 20 \
     --novelty_alpha 0.6 \
-    --alpha_fidelity 1 \
     --lr 0.1 \
     --cbl_lr_divisor 100 \
     --batch_size 128 \
     --num_workers 2 \
-    --exp_name "stage2-FRB_Ph_1-2-PCL_lr_0.1-max_0.3-dpmm_warm_start-alpha_fidelity_1-w_cl_0.5" \
+    --exp_name "stage2-FRB_Ph_1-2-PCL_lr_0.1-max_0.5-dpmm_warm_start-phase1_lambda_0.5-anchor_known_1-freeze_known_protos-hungarian_frozen_known" \
     --use_wandb True \
     --wandb_project "$WANDB_PROJECT" \
     --wandb_entity "$WANDB_ENTITY" \
     --pos_weight_clip 20 \
     --freeze_backbone True \
-    --phase1_lambda 0.1 \
-    --lambda_max 0.3 \
+    --alpha_fidelity 0.1 \
+    --phase1_lambda 0.5 \
+    --lambda_max 0.5 \
+    --w_cl 1
     --dpmm_warm_start True \
-    --freeze_known_protos False \
-    --anchor_known 0 \
+    --freeze_known_protos True \
+    --anchor_known 1 \
     --protect_known_grad False \
     --protect_known_energy 0.99
-    --w_cl 0.5
+    --hungarian_frozen_known True
 
 date
