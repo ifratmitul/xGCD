@@ -15,6 +15,37 @@ import torch
 
 from project_utils.cluster_and_log_utils import split_cluster_acc_v2
 
+def split_cluster_acc_frozen_known(y_true, preds, k_known: int, total_classes: int):
+    """All/Old/New accuracy with the KNOWN prototypes FIXED to their classes.
+
+    Known prototype k (id < k_known) always denotes known class k, so the matching can
+    never relabel it as a novel class. Only the novel prototypes (id >= k_known) are
+    Hungarian-matched to the novel classes. This stops a large novel cluster sitting near
+    a known prototype from 'stealing' that known class in the score (the Old-drop artifact).
+    """
+    y_true = np.asarray(y_true).astype(int)
+    preds = np.asarray(preds).astype(int)
+    pred_class = preds.copy()                      # known prototypes already == their class id
+
+    novel_ids = sorted(set(preds[preds >= k_known].tolist()))
+    novel_classes = list(range(k_known, total_classes))
+    if novel_ids and novel_classes:
+        C = np.zeros((len(novel_ids), len(novel_classes)), dtype=np.int64)
+        for i, c in enumerate(novel_ids):
+            m = preds == c
+            for j, k in enumerate(novel_classes):
+                C[i, j] = int(np.sum(m & (y_true == k)))
+        r_ind, c_ind = linear_sum_assignment(-C)   # maximise overlap; matches min(#clusters,#classes)
+        matched = {novel_ids[r]: novel_classes[c] for r, c in zip(r_ind, c_ind)}
+        for c in novel_ids:
+            pred_class[preds == c] = matched.get(c, -1)   # unmatched novel cluster -> counted wrong
+
+    correct = pred_class == y_true
+    mask_old = y_true < k_known
+    all_acc = float(correct.mean())
+    old_acc = float(correct[mask_old].mean()) if mask_old.any() else 0.0
+    new_acc = float(correct[~mask_old].mean()) if (~mask_old).any() else 0.0
+    return all_acc, old_acc, new_acc
 
 @torch.no_grad()
 def assign_to_prototypes(logits: torch.Tensor, prototypes: torch.Tensor, lda) -> torch.Tensor:
@@ -26,12 +57,21 @@ def assign_to_prototypes(logits: torch.Tensor, prototypes: torch.Tensor, lda) ->
 
 @torch.no_grad()
 def evaluate_gcd(logits: torch.Tensor, labels: torch.Tensor, prototypes: torch.Tensor,
-                 lda, num_labeled_classes: int, total_classes: int) -> dict:
-    """All/Old/New ACC + K^n error over an unlabelled set (logits, GT labels)."""
+                 lda, num_labeled_classes: int, total_classes: int,
+                 frozen_known: bool = False) -> dict:
+    """All/Old/New ACC + K^n error over an unlabelled set (logits, GT labels).
+
+    frozen_known=True fixes known prototypes to their classes and only Hungarian-matches
+    the novel prototypes (prevents a novel cluster from stealing a known class in the score).
+    """
     preds = assign_to_prototypes(logits, prototypes, lda).cpu().numpy()
     y_true = labels.cpu().numpy().astype(int)
     mask_old = y_true < num_labeled_classes                      # True for known classes
-    all_acc, old_acc, new_acc = split_cluster_acc_v2(y_true, preds, mask_old)
+    if frozen_known:
+        all_acc, old_acc, new_acc = split_cluster_acc_frozen_known(
+            y_true, preds, num_labeled_classes, total_classes)
+    else:
+        all_acc, old_acc, new_acc = split_cluster_acc_v2(y_true, preds, mask_old)
 
     k_hat = prototypes.shape[0] - num_labeled_classes
     k_true = total_classes - num_labeled_classes
@@ -40,6 +80,7 @@ def evaluate_gcd(logits: torch.Tensor, labels: torch.Tensor, prototypes: torch.T
         "k_hat_novel": int(k_hat), "k_novel_true": int(k_true),
         "k_novel_err": int(abs(k_hat - k_true)),
     }
+
 
 
 @torch.no_grad()
