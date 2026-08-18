@@ -511,6 +511,8 @@ def get_xgcd_parser():
                    help="hard-freeze known-feature directions in the CBL weight (projection); alternative to --anchor_known")
     p.add_argument("--protect_known_energy", type=float, default=0.99,
                    help="fraction of known-feature variance to protect (higher = more dirs frozen, less room for novel)")
+    p.add_argument("--hungarian_frozen_known", type=str2bool, default=False,
+                   help="eval: fix known prototypes to their classes; only Hungarian-match novel prototypes (stops a novel cluster stealing a known class -> the Old-drop artifact)")
     p.add_argument("--pos_weight_clip", type=float, default=50.0)
     p.add_argument("--pcl_known_unlab_weight", type=float, default=0.0,
                    help="L_PCL weight for unlabelled samples the gate assigned to a KNOWN "
