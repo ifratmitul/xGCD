@@ -491,7 +491,6 @@ def get_xgcd_parser():
     p.add_argument("--cbl_hidden_layers", type=int, default=0)
     p.add_argument("--pretrain", type=str, default="dino")
     p.add_argument("--pretrain_path", type=str, default=None)
-    p.add_argument("--freeze_backbone", type=str2bool, default=False)
     p.add_argument("--freeze_known_protos", type=str2bool, default=False,
                    help="freeze known means + Sigma at the start of phase 2 (only novel means update)")
     # schedule
