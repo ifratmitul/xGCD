@@ -152,7 +152,7 @@ def mstep_loss(model, images, labels, uq, mask_lab, state, lookup, pos_weight, l
     else:
         L_bce = torch.zeros((), device=device)
 
-    loss = L_cl + lambda_t * L_pcl + args.alpha_fidelity * L_bce
+    loss = L_cl + getattr(args, "pcl_weight", 1.0) * lambda_t * L_pcl + args.alpha_fidelity * L_bce
     # [cl-scale] whitened-distance scale: pos = matching views (diag), neg = off-diagonal.
     with torch.no_grad():
         d2 = mahalanobis_sq_pairs(z1, z2, None)
@@ -210,7 +210,9 @@ def run_xgcd(args):
     merged_train = DataLoader(merged, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, drop_last=True)
 
-    total_epochs = args.warmup_epochs + args.epochs
+    # estimation_only: run only Phase-1 warmup, then freeze -> one E-step + eval (the
+    # post-loop final E-step). No Phase-2 joint loop / no M-step after the DPMM.
+    total_epochs = args.warmup_epochs if args.estimation_only else args.warmup_epochs + args.epochs
     if args.freeze_backbone:
         # anti-forgetting: keep the DINO features fixed, adapt only the concept layer.
         # The CBL is a sensitive linear layer (Stage 1 trained it at 1e-4) -> use the
@@ -390,8 +392,12 @@ def get_xgcd_parser():
     # schedule
     p.add_argument("--warmup_epochs", type=int, default=20, help="Phase 1 (T0) epochs")
     p.add_argument("--epochs", type=int, default=200, help="Phase 2 joint epochs")
+    p.add_argument("--estimation_only", type=str2bool, default=False,
+                   help="warmup -> freeze -> one E-step + eval (no Phase-2 joint loop)")
     p.add_argument("--refresh_period", type=int, default=5, help="E-step refresh period R")
     p.add_argument("--lambda_warmup", type=int, default=20, help="lambda(t)=min(1,t/T)")
+    p.add_argument("--pcl_weight", type=float, default=1.0,
+                   help="constant multiplier on L_PCL (both phases). 0.0 = L_PCL fully off (ablation)")
     # losses / metric
     p.add_argument("--temperature", type=float, default=1.0,
                    help="softmax temperature; d^2 is already normalised by C in the losses")
@@ -413,6 +419,9 @@ def get_xgcd_parser():
     p.add_argument("--dpmm_max_points", type=int, default=8000)
     p.add_argument("--dpmm_min_cluster_size", type=int, default=10)
     p.add_argument("--dpmm_min_pool", type=int, default=10)
+    p.add_argument("--dpmm_cov_scale", type=str, default="1.0",
+                   help="Stage-B covariance scale s (fix #3): 'auto' iterates, a float pins it, '1.0'=off")
+    p.add_argument("--dpmm_cov_iters", type=int, default=3, help="max auto cov-scale iterations")
     # optim
     p.add_argument("--lr", type=float, default=0.1)
     p.add_argument("--cbl_lr_divisor", type=float, default=100.0, help="CBL LR = lr / this (non-frozen)")

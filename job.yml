@@ -64,16 +64,21 @@ spec:
                 STAGE1_EPOCHS=50; WARMUP=5; STAGE2_EPOCHS=30; REFRESH=2
             fi
 
-            # ---- ABLATION: fix #2 + #3 (empirical gate + live L_CL). #1 still OFF ----
+            # ---- ESTIMATION-ONLY: warmup -> freeze -> one E-step (DPMM fixes 2+3) -> eval ----
+            #      No Phase-2 joint loop / no DPMM->representation M-step.
             FREEZE_BACKBONE="True"
             CBL_LR="1e-3"          # CBL LR when frozen (0.1 diverges!)
             ALPHA_FIDELITY="0.5"
             NOVELTY_ALPHA="0.2"
             TAU_MODE="empirical"     # fix #2 ON  (data-calibrated gate)
-            PCL_KNOWN_UNLAB_W="1.0"  # fix #1 OFF (contaminating PCL, pre-fix)
-            NORM_D2_BY_C="True"      # fix #3 ON  (live L_CL/L_PCL, d^2/C)
+            PCL_KNOWN_UNLAB_W="1.0"  # (irrelevant here)
+            NORM_D2_BY_C="True"      # live L_CL, d^2/C
+            PCL_WEIGHT="1.0"         # keep L_PCL(gt) in the labelled warmup (the 0.784->0.835 lift)
             GRAD_CLIP="1.0"        # safety net against blow-ups
-            S2_EXP="stage2_abl_empirical_cl"
+            ESTIMATION_ONLY="True"   # warmup then freeze; no joint loop
+            DPMM_COV_SCALE="auto"    # fix #3: covariance-mismatch scaling (auto-iterated)
+            DPMM_ALPHA="1.0"         # sweep 0.3 / 0.1 in follow-up runs
+            S2_EXP="stage2_estonly_covauto_a1"
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -131,7 +136,11 @@ spec:
                 --alpha_fidelity "$ALPHA_FIDELITY" \
                 --pcl_known_unlab_weight "$PCL_KNOWN_UNLAB_W" \
                 --norm_d2_by_c "$NORM_D2_BY_C" \
+                --pcl_weight "$PCL_WEIGHT" \
                 --grad_clip "$GRAD_CLIP" \
+                --estimation_only "$ESTIMATION_ONLY" \
+                --dpmm_cov_scale "$DPMM_COV_SCALE" \
+                --dpmm_alpha "$DPMM_ALPHA" \
                 --lr 0.1 \
                 --cbl_lr_divisor 100 \
                 --batch_size 128 \

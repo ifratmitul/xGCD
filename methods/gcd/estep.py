@@ -35,6 +35,65 @@ class EStepResult:
     tau_chi2: float = 0.0
     lab_reject: float = 0.0
     novel_recall: float = None
+    dpmm_s_applied: float = 1.0   # covariance scale used in Stage B
+    dpmm_s_measured: float = 0.0  # covariance scale the data asked for (tr(within)/tr(Sigma))
+
+
+def _clamp_s(s: float, lo: float = 1.0, hi: float = 10.0) -> float:
+    """Clamp the covariance-scale s to [lo, hi]. s<1 would tighten (more splitting);
+    unbounded s flattens all likelihoods until everything merges."""
+    if s > hi:
+        logger.warning(f"[dpmm cov-scale] measured s={s:.2f} hit cap {hi}")
+    return float(min(max(s, lo), hi))
+
+
+def _measure_cov_scale(pool: torch.Tensor, assignments: torch.Tensor, lda) -> float:
+    """s = tr(pooled within-cluster scatter) / tr(Sigma), on the FINAL (post-prune)
+    clusters, using EMPIRICAL cluster means (measuring spread, not doing inference).
+    Naturally size-weighted (pooled estimator: big clusters dominate)."""
+    C = pool.shape[1]
+    S = torch.zeros(C, C, dtype=pool.dtype)
+    total, n_k = 0, 0
+    K = int(assignments.max()) + 1 if len(assignments) else 0
+    for k in range(K):
+        Xk = pool[assignments == k]
+        if len(Xk) < 2:
+            continue
+        d = Xk - Xk.mean(0)                       # empirical cluster mean
+        S += d.T @ d
+        total += len(Xk); n_k += 1
+    within = S / max(total - n_k, 1)              # pooled within-cluster covariance
+    return float(torch.trace(within) / torch.trace(lda.cov.cpu()))
+
+
+def _fit_dpmm(pool, lda, m0, args, dpmm_kwargs):
+    """Fit Stage-B DPMM applying the covariance-mismatch scale s (fix #3).
+    dpmm_cov_scale='auto' iterates fit->measure->refit (|ds|<0.1 or <=cov_iters) since the
+    first-pass s is biased low; a float pins s; '1.0' = off. Always measures+logs the s the
+    data asked for. Returns (dp, s_applied, s_measured)."""
+    mode = str(getattr(args, "dpmm_cov_scale", "1.0"))
+    max_iters = getattr(args, "dpmm_cov_iters", 3)
+
+    def one_fit(s):
+        return DPMM(**dpmm_kwargs).fit(pool, lda, m0=m0, cov_scale=s)
+
+    if mode == "auto":
+        s_applied, s_meas = 1.0, 1.0
+        for it in range(max_iters):
+            dp = one_fit(s_applied)
+            s_meas = _clamp_s(_measure_cov_scale(pool, dp.assignments, lda))
+            logger.info(f"[dpmm cov-scale] iter {it}: applied={s_applied:.2f} "
+                        f"measured={s_meas:.2f} K^n={dp.n_components}")
+            if abs(s_meas - s_applied) < 0.1:
+                break
+            s_applied = s_meas
+        return dp, s_applied, s_meas
+
+    s = float(mode)
+    dp = one_fit(s)
+    s_meas = _clamp_s(_measure_cov_scale(pool, dp.assignments, lda))
+    logger.info(f"[dpmm cov-scale] applied s={s:.2f} | data asked s={s_meas:.2f} | K^n={dp.n_components}")
+    return dp, s, s_meas
 
 
 def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
@@ -111,14 +170,16 @@ def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
                 for c, n in zip(uniq.tolist(), cnts.tolist()))
             logger.info(f"[pool] class composition: {comp}")
 
-    # 3. Stage B DPMM on the novel pool
+    # 3. Stage B DPMM on the novel pool (with covariance-mismatch scaling, fix #3)
     k_novel = 0
+    s_applied, s_measured = 1.0, 0.0
     novel_means = torch.zeros(0, lda.C, device=lda.means.device)
     if len(nov.novel_idx) >= min_novel:
         pool = unlab_logits[nov.novel_idx]
         m0 = unlab_logits.mean(0)                  # empirical-Bayes base-measure mean
-        dp = DPMM(alpha=dpmm_alpha, beta=dpmm_beta, n_sweeps=dpmm_sweeps,
-                  max_points=dpmm_max_pts, min_cluster_size=dpmm_min_cluster).fit(pool, lda, m0=m0)
+        dpmm_kwargs = dict(alpha=dpmm_alpha, beta=dpmm_beta, n_sweeps=dpmm_sweeps,
+                           max_points=dpmm_max_pts, min_cluster_size=dpmm_min_cluster)
+        dp, s_applied, s_measured = _fit_dpmm(pool, lda, m0, args, dpmm_kwargs)
         k_novel = dp.n_components
         novel_means = dp.means.to(assignments.device if assignments.is_floating_point()
                                   else lda.means.device)
@@ -128,9 +189,11 @@ def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
         logger.warning(f"Novel pool too small ({len(nov.novel_idx)} < {min_novel}); K^n=0 this round")
 
     prototypes = torch.cat([lda.means, novel_means.to(lda.means.device)], dim=0)
-    logger.info(f"E-step: K^l={k_known}, K^n={k_novel}, total prototypes={prototypes.shape[0]}")
+    logger.info(f"E-step: K^l={k_known}, K^n={k_novel}, total prototypes={prototypes.shape[0]} "
+                f"| cov-scale s applied={s_applied:.2f} measured={s_measured:.2f}")
 
     return EStepResult(lda=lda, prototypes=prototypes, assignments=assignments,
                        k_known=k_known, k_novel=k_novel, novel_idx=nov.novel_idx, tau=nov.tau,
                        tau_emp=tau_emp, tau_chi2=tau_chi2, lab_reject=lab_reject,
-                       novel_recall=novel_recall)
+                       novel_recall=novel_recall,
+                       dpmm_s_applied=s_applied, dpmm_s_measured=s_measured)
