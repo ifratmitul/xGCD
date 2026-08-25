@@ -66,6 +66,163 @@ def _measure_cov_scale(pool: torch.Tensor, assignments: torch.Tensor, lda) -> fl
     return float(torch.trace(within) / torch.trace(lda.cov.cpu()))
 
 
+def _measure_cov_scale_gt(pool: torch.Tensor, pool_gt: torch.Tensor, k_known: int, lda) -> Optional[float]:
+    """GT-based over-spread check (diagnosis only): pooled within-TRUE-novel-class scatter
+    (empirical GT-class means) / tr(Sigma) — the s the data would ask for under PERFECT
+    novel clustering. Settles the over-spread hypothesis with labels instead of the DPMM's
+    own (possibly split/merged) assignments. None if <2 true-novel classes are in the pool."""
+    novel_mask = pool_gt >= k_known
+    g = pool_gt[novel_mask]
+    classes = torch.unique(g).tolist()
+    if len(classes) < 2:
+        return None
+    X = pool.detach().cpu()[novel_mask.cpu()]
+    remap = {int(c): i for i, c in enumerate(classes)}
+    a = torch.tensor([remap[int(c)] for c in g.tolist()])
+    return _measure_cov_scale(X, a, lda)
+
+
+def _log_cluster_composition(cluster_ids: torch.Tensor, gt_labels: torch.Tensor,
+                             k_novel: int, k_known: int, tag: str = ""):
+    """Log each DPMM cluster's ground-truth class histogram (diagnosis only).
+    Labels each cluster: LEAK (a known class dominates), or novel c<k>; then flags
+    splits = novel classes claimed as the dominant class by >1 cluster."""
+    pre = f"[dpmm-cluster{'/' + tag if tag else ''}]"
+    dominant = {}
+    for j in range(k_novel):
+        lbls = gt_labels[cluster_ids == j]
+        if len(lbls) == 0:
+            continue
+        uniq, cnts = torch.unique(lbls, return_counts=True)
+        order = cnts.argsort(descending=True)
+        dom_c, dom_n, N = int(uniq[order[0]]), int(cnts[order[0]]), len(lbls)
+        kind = f"LEAK known-c{dom_c}" if dom_c < k_known else f"novel-c{dom_c}"
+        top = ", ".join(f"c{int(uniq[o])}={int(cnts[o])}" for o in order[:4])
+        logger.info(f"{pre} {j}: size={N} {kind} ({100*dom_n/N:.0f}%) | {top}")
+        dominant[j] = dom_c
+    from collections import Counter
+    dom_counts = Counter(dominant.values())
+    splits = sorted(c for c, n in dom_counts.items() if n > 1 and c >= k_known)
+    leaks = sorted(j for j, c in dominant.items() if c < k_known)
+    logger.info(f"{pre} summary: {k_novel} clusters | "
+                f"split novel classes={splits} | leak clusters (idx)={leaks}")
+
+
+def _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args):
+    """Cluster-level cleanup of the raw DPMM output (fix #2, cluster level). Three passes:
+
+      pass 1 absorb: a novel cluster whose CENTROID sits in the known region — nearest
+             known prototype within `absorb_scale*tau` AND nearer than any novel peer —
+             is a known-class leak. Drop it; its members fall back to that known class.
+      pass 2 merge: novel clusters that are one class the DPMM split. COMPLETE linkage
+             (every cross-pair centroid distance < `merge_scale*tau`), not single linkage,
+             so a fragment can't daisy-chain two real classes through a junk bridge.
+      pass 3 re-absorb: a merged group's new centroid may now land on a known prototype
+             (e.g. two leak halves that each failed pass 1, or two leaks off one class that
+             are nearer each other than the prototype); re-run the absorb test on group
+             centroids so those get caught too.
+
+    All tests use the shared-Sigma Mahalanobis metric; tau is the class radius the gate
+    calibrated, the natural yardstick. Per-cluster distances + decisions are logged (a
+    log-only pass with both flags off still prints the evidence). Returns
+    (novel_means [K',C], pool_ids [N_pool]): pool_ids < k_known is an absorbed sample
+    routed to that known class; >= k_known is k_known + new novel id.
+    """
+    dev = lda.means.device
+    beta = getattr(args, "dpmm_beta", 1.0)
+    do_absorb = getattr(args, "dpmm_absorb", False)
+    do_merge = getattr(args, "dpmm_merge", False)
+    absorb_tau = getattr(args, "absorb_scale", 1.0) * tau
+    merge_tau = getattr(args, "merge_scale", 1.0) * tau
+
+    means = dp.means.to(dev)                              # [K, C] posterior component means
+    z = dp.assignments.to(dev)                            # [N_pool]
+    pool = pool.to(dev)
+    m0 = m0.to(dev)
+    K = means.shape[0]
+
+    def group_mask(g):
+        m = torch.zeros(len(z), dtype=torch.bool, device=dev)
+        for k in g:
+            m |= (z == k)
+        return m
+
+    def posterior_mean(mask):                            # Eq 11 (s cancels -> cov_scale-free)
+        Xk = pool[mask]
+        return (m0 + beta * Xk.sum(0)) / (1.0 + beta * len(Xk))
+
+    d_known = lda.mahalanobis_sq(means, lda.means)        # [K, k_known] centroid -> known
+    nn_known_d, nn_known_j = d_known.min(1)
+    d_nov = lda.mahalanobis_sq(means, means)              # [K, K] centroid -> centroid
+    d_nov = d_nov + torch.eye(K, device=dev) * 1e12       # mask self-distance
+    nn_nov_d, _ = d_nov.min(1)
+
+    # ---- pass 1: absorb individual leak clusters ----
+    absorbed = torch.zeros(K, dtype=torch.bool, device=dev)
+    if do_absorb:
+        absorbed = (nn_known_d < absorb_tau) & (nn_known_d < nn_nov_d)
+    for k in range(K):
+        tagk = f"ABSORB->known-c{int(nn_known_j[k])}" if bool(absorbed[k]) else "keep"
+        logger.info(f"[absorb] cluster {k}: d2_nearest_known={float(nn_known_d[k]):.1f} "
+                    f"(c{int(nn_known_j[k])})  d2_nearest_novel={float(nn_nov_d[k]):.1f}  "
+                    f"absorb_tau={absorb_tau:.1f} -> {tagk}")
+
+    # ---- pass 2: complete-linkage merge among survivors ----
+    groups = [[k] for k in range(K) if not bool(absorbed[k])]
+    if do_merge:
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(groups)):
+                for j in range(i + 1, len(groups)):
+                    cross = [float(d_nov[a, b]) for a in groups[i] for b in groups[j]]
+                    if cross and max(cross) < merge_tau:   # complete linkage
+                        logger.info(f"[merge] groups {groups[i]} + {groups[j]} "
+                                    f"max_d2={max(cross):.1f} < merge_tau={merge_tau:.1f}")
+                        groups[i] = groups[i] + groups[j]
+                        groups.pop(j)
+                        changed = True
+                        break
+                if changed:
+                    break
+
+    # ---- pass 3: re-absorb merged-group centroids ----
+    absorbed_group = {}                                   # group idx -> known class id
+    if do_absorb and any(len(g) > 1 for g in groups):
+        gcen = torch.stack([posterior_mean(group_mask(g)) for g in groups])
+        gd_known = lda.mahalanobis_sq(gcen, lda.means)
+        gnn_d, gnn_j = gd_known.min(1)
+        gd_nov = lda.mahalanobis_sq(gcen, gcen) + torch.eye(len(groups), device=dev) * 1e12
+        gnn_nov = gd_nov.min(1).values if len(groups) > 1 else torch.full((len(groups),), 1e12, device=dev)
+        for gi, g in enumerate(groups):
+            if len(g) > 1 and bool(gnn_d[gi] < absorb_tau) and bool(gnn_d[gi] < gnn_nov[gi]):
+                absorbed_group[gi] = int(gnn_j[gi])
+                logger.info(f"[absorb/post-merge] group {g} centroid d2_known={float(gnn_d[gi]):.1f}"
+                            f"(c{int(gnn_j[gi])}) d2_novel={float(gnn_nov[gi]):.1f} -> ABSORB")
+
+    # ---- assemble: known ids for absorbed, contiguous novel ids for survivors ----
+    final_groups = [g for gi, g in enumerate(groups) if gi not in absorbed_group]
+    pool_ids = torch.empty(len(z), dtype=torch.long, device=dev)
+    for k in range(K):                                    # pass-1 absorbed singletons
+        if bool(absorbed[k]):
+            pool_ids[z == k] = int(nn_known_j[k])
+    for gi, kn in absorbed_group.items():                 # pass-3 absorbed groups
+        for k in groups[gi]:
+            pool_ids[z == k] = kn
+    for new_id, g in enumerate(final_groups):             # surviving novel groups
+        for k in g:
+            pool_ids[z == k] = k_known + new_id
+
+    new_means = torch.stack([posterior_mean(group_mask(g)) for g in final_groups]) \
+        if final_groups else torch.zeros(0, pool.shape[1], device=dev)
+
+    n_pass1 = int(absorbed.sum())
+    n_merged = len([k for g in groups for k in g]) - len(groups)   # clusters folded by merge
+    logger.info(f"[absorb-merge] K^n {K} -> {len(final_groups)} (pass1-absorbed {n_pass1}, "
+                f"merged {n_merged}, post-merge-absorbed {len(absorbed_group)})")
+    return new_means, pool_ids
+
+
 def _fit_dpmm(pool, lda, m0, args, dpmm_kwargs):
     """Fit Stage-B DPMM applying the covariance-mismatch scale s (fix #3).
     dpmm_cov_scale='auto' iterates fit->measure->refit (|ds|<0.1 or <=cov_iters) since the
@@ -81,9 +238,10 @@ def _fit_dpmm(pool, lda, m0, args, dpmm_kwargs):
         s_applied, s_meas = 1.0, 1.0
         for it in range(max_iters):
             dp = one_fit(s_applied)
-            s_meas = _clamp_s(_measure_cov_scale(pool, dp.assignments, lda))
+            raw = _measure_cov_scale(pool, dp.assignments, lda)   # pre-clamp
+            s_meas = _clamp_s(raw)
             logger.info(f"[dpmm cov-scale] iter {it}: applied={s_applied:.2f} "
-                        f"measured={s_meas:.2f} K^n={dp.n_components}")
+                        f"measured={s_meas:.2f} raw={raw:.3f} K^n={dp.n_components}")
             if abs(s_meas - s_applied) < 0.1:
                 break
             s_applied = s_meas
@@ -91,8 +249,10 @@ def _fit_dpmm(pool, lda, m0, args, dpmm_kwargs):
 
     s = float(mode)
     dp = one_fit(s)
-    s_meas = _clamp_s(_measure_cov_scale(pool, dp.assignments, lda))
-    logger.info(f"[dpmm cov-scale] applied s={s:.2f} | data asked s={s_meas:.2f} | K^n={dp.n_components}")
+    raw = _measure_cov_scale(pool, dp.assignments, lda)           # pre-clamp
+    s_meas = _clamp_s(raw)
+    logger.info(f"[dpmm cov-scale] applied s={s:.2f} | data asked s={s_meas:.2f} "
+                f"raw={raw:.3f} | K^n={dp.n_components}")
     return dp, s, s_meas
 
 
@@ -107,6 +267,7 @@ def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
     dpmm_max_pts = getattr(args, "dpmm_max_points", 8000)
     dpmm_min_cluster = getattr(args, "dpmm_min_cluster_size", 10)
     min_novel = getattr(args, "dpmm_min_pool", 10)
+    dpmm_seed = getattr(args, "dpmm_seed", 42)
 
     # 1. known-class geometry
     lda = LDAGaussian(ridge_gamma=ridge).fit(labelled_logits, labelled_labels)
@@ -178,13 +339,45 @@ def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
         pool = unlab_logits[nov.novel_idx]
         m0 = unlab_logits.mean(0)                  # empirical-Bayes base-measure mean
         dpmm_kwargs = dict(alpha=dpmm_alpha, beta=dpmm_beta, n_sweeps=dpmm_sweeps,
-                           max_points=dpmm_max_pts, min_cluster_size=dpmm_min_cluster)
+                           max_points=dpmm_max_pts, min_cluster_size=dpmm_min_cluster,
+                           seed=dpmm_seed)
         dp, s_applied, s_measured = _fit_dpmm(pool, lda, m0, args, dpmm_kwargs)
-        k_novel = dp.n_components
-        novel_means = dp.means.to(assignments.device if assignments.is_floating_point()
-                                  else lda.means.device)
-        # novel samples get ids K^l + their DPMM cluster id
-        assignments[nov.novel_idx] = k_known + dp.assignments.to(assignments.device)
+        pool_gt = unlab_labels[nov.novel_idx].cpu() if unlab_labels is not None else None
+
+        # GT-based over-spread check (diagnosis only): the s a PERFECT novel clustering would
+        # ask for. Closes the cov-mismatch hypothesis with labels, not DPMM assignments.
+        if pool_gt is not None:
+            raw_gt = _measure_cov_scale_gt(pool, pool_gt, k_known, lda)
+            if raw_gt is not None:
+                logger.info(f"[cov-scale-gt] within-GT-novel-class scatter / tr(Sigma) = {raw_gt:.3f} "
+                            f"(>1 = novel classes broader than the known-fit Sigma)")
+
+        # raw per-cluster GT composition (diagnosis only; labels never used for decisions).
+        # Tells which of the K^n clusters are clean-novel / splits (a novel class in >1
+        # cluster) / leaks (a known class dominating a "novel" cluster).
+        if pool_gt is not None and dp.n_components > 0:
+            _log_cluster_composition(dp.assignments.cpu(), pool_gt, dp.n_components, k_known,
+                                     tag="raw")
+
+        # cluster-level cleanup: absorb known-leaks, merge DPMM splits (fix #2). ALWAYS run
+        # so the [absorb]/[merge] distance tables print; the dpmm_absorb/dpmm_merge flags
+        # only control whether decisions fire, so a both-off run is the log-only calibration
+        # pass (identity mapping, same K^n as raw).
+        if dp.n_components > 0:
+            novel_means, pool_ids = _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args)
+            k_novel = novel_means.shape[0]
+            assignments[nov.novel_idx] = pool_ids.to(assignments.device)
+            if pool_gt is not None:
+                # absorbed-sample audit: did the leaks route to their TRUE known class?
+                absorbed_mask = pool_ids.cpu() < k_known
+                n_abs = int(absorbed_mask.sum())
+                if n_abs > 0:
+                    correct = int((pool_ids.cpu()[absorbed_mask] == pool_gt[absorbed_mask]).sum())
+                    logger.info(f"[absorb-acc] {n_abs} samples absorbed->known | "
+                                f"{correct}/{n_abs} ({100*correct/n_abs:.1f}%) matched routed known class")
+                if k_novel > 0:
+                    _log_cluster_composition((pool_ids.cpu() - k_known), pool_gt, k_novel, k_known,
+                                             tag="final")
     else:
         logger.warning(f"Novel pool too small ({len(nov.novel_idx)} < {min_novel}); K^n=0 this round")
 

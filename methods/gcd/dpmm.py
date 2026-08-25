@@ -37,7 +37,7 @@ class DPMMResult:
 class DPMM:
     def __init__(self, alpha: float = 1.0, beta: float = 1.0, n_sweeps: int = 30,
                  max_points: Optional[int] = 8000, patience: int = 3,
-                 min_cluster_size: int = 10, seed: int = 0):
+                 min_cluster_size: int = 10, seed: int = 42):
         self.alpha = alpha
         self.beta = beta
         self.n_sweeps = n_sweeps

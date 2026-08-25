@@ -83,7 +83,9 @@ def compute_estep(model, lab_loader, unlab_loader, phase, args, device):
     res = run_estep(lab_logits, lab_labels, unlab_logits, args, unlab_labels=unlab_labels)
 
     max_uq = int(max(int(lab_uq.max()), int(unlab_uq.max()))) + 1
-    assign_by_uq = torch.zeros(max_uq, dtype=torch.long, device=device)
+    # -1 (not 0): an unmapped uq must be IGNORED by L_PCL, not silently pulled onto known
+    # class 0. mstep_loss's sanitizer drops targets outside [0, K).
+    assign_by_uq = torch.full((max_uq,), -1, dtype=torch.long, device=device)
     assign_by_uq[unlab_uq.long()] = res.assignments.to(device)
 
     return dict(lda=res.lda.to(device), prototypes=res.prototypes.to(device),
@@ -419,9 +421,20 @@ def get_xgcd_parser():
     p.add_argument("--dpmm_max_points", type=int, default=8000)
     p.add_argument("--dpmm_min_cluster_size", type=int, default=10)
     p.add_argument("--dpmm_min_pool", type=int, default=10)
+    p.add_argument("--dpmm_seed", type=int, default=42, help="DPMM Gibbs seed (single-seed; multi-seed later)")
     p.add_argument("--dpmm_cov_scale", type=str, default="1.0",
                    help="Stage-B covariance scale s (fix #3): 'auto' iterates, a float pins it, '1.0'=off")
     p.add_argument("--dpmm_cov_iters", type=int, default=3, help="max auto cov-scale iterations")
+    # cluster-level cleanup (fix #2): absorb known-leaks, merge DPMM splits. Both off = the
+    # [absorb]/[merge] lines still log the calibration distances (log-only pass).
+    p.add_argument("--dpmm_absorb", type=str2bool, default=False,
+                   help="absorb a novel cluster whose centroid sits on a known prototype (leak cleanup)")
+    p.add_argument("--dpmm_merge", type=str2bool, default=False,
+                   help="merge novel clusters with mutually close centroids (DPMM split cleanup)")
+    p.add_argument("--absorb_scale", type=float, default=1.0,
+                   help="absorb if d2(centroid, nearest known) < absorb_scale * tau")
+    p.add_argument("--merge_scale", type=float, default=1.0,
+                   help="merge two novel clusters if d2(centroids) < merge_scale * tau")
     # optim
     p.add_argument("--lr", type=float, default=0.1)
     p.add_argument("--cbl_lr_divisor", type=float, default=100.0, help="CBL LR = lr / this (non-frozen)")
