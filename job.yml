@@ -61,9 +61,9 @@ spec:
             if [ "$SMOKE" = "1" ]; then
                 STAGE1_EPOCHS=2; WARMUP=2; STAGE2_EPOCHS=4; REFRESH=2
             else
-                # WARMUP=1: strip the warmup-fusion confound so absorb/merge runs on the
-                # clean rep (all 5 novel classes still separated). Re-add warmup later.
-                STAGE1_EPOCHS=50; WARMUP=1; STAGE2_EPOCHS=30; REFRESH=2
+                # WARMUP=0: even 1 warmup epoch fused c5/c7 (New 0.857->0.702). The untrained
+                # Stage-1 rep keeps all 5 novel classes separated -> estimate on it directly.
+                STAGE1_EPOCHS=50; WARMUP=0; STAGE2_EPOCHS=30; REFRESH=2
             fi
 
             # ---- ESTIMATION-ONLY: warmup -> freeze -> one E-step (DPMM fixes 2+3) -> eval ----
@@ -81,14 +81,14 @@ spec:
             DPMM_COV_SCALE="1.0"     # fix #3 OFF — a merge error argues against s>1 here
             DPMM_ALPHA="1.0"         # sweep 0.3 / 0.1 in follow-up runs
             DPMM_SEED="42"           # DPMM Gibbs seed (was silently 0)
-            # fix #2 cluster-level cleanup. LOG-ONLY calibration run: flags OFF so the
-            # [absorb]/[merge] distance tables + [cov-scale-gt] print WITHOUT changing K^n.
-            # Read the tables, pick absorb_scale/merge_scale, THEN flip these to True.
-            DPMM_ABSORB="False"
-            DPMM_MERGE="False"
-            ABSORB_SCALE="1.0"       # absorb if d2(centroid, nearest known) < scale*tau
-            MERGE_SCALE="1.0"        # merge if d2(centroids) < scale*tau  (calibrate from logs)
-            S2_EXP="stage2_estonly_logonly_calib"
+            # fix #2 cleanup, calibrated from the log-only run:
+            #   leak cluster d2_nearest_known=0.7 vs every real novel >=13 -> scale 0.1 (tau*0.1
+            #   ~=5.8) catches the leak, spares all novels. scale 1.0 would absorb 4 real novels.
+            DPMM_ABSORB="True"
+            DPMM_MERGE="False"       # novel centroids packed 19-45; no safe merge threshold
+            ABSORB_SCALE="0.1"       # absorb if d2(centroid, nearest known) < scale*tau
+            MERGE_SCALE="1.0"        # (unused while merge off)
+            S2_EXP="stage2_estonly_absorb01_w0"
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -190,13 +190,13 @@ spec:
           mountPath: /dev/shm
         resources:
           requests:
-            memory: "32Gi"
+            memory: "16Gi"
             cpu: "4"
-            nvidia.com/rtxa6000: 1
+            nvidia.com/gpu: 1
           limits:
-            memory: "32Gi"
+            memory: "16Gi"
             cpu: "4"
-            nvidia.com/rtxa6000: 1
+            nvidia.com/gpu: 1
         env:
         - name: WANDB_API_KEY
           value: "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"

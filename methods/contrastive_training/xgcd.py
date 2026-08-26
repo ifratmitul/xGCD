@@ -226,7 +226,9 @@ def run_xgcd(args):
     else:
         param_groups = model.param_groups(args.lr, args.lr / args.cbl_lr_divisor)
     optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
+    # max(.,1): warmup_epochs=0 (estimation on the raw Stage-1 rep, no training loop) would
+    # give T_max=0. The loop never steps the scheduler in that case, so the value is inert.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(total_epochs, 1))
 
     # baseline eval (epoch 0): the starting point straight from the Stage-1 CBL, before
     # any Stage-2 training. Distinguishes "training collapsed a good rep" (baseline high,
