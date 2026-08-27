@@ -56,12 +56,39 @@ spec:
             export WANDB_DIR="logs"   # offline run data under logs/wandb/
 
             # Set SMOKE=1 in the job for a fast integration run.
+            # RUN 1 = anti-forgetting experiment: short schedule to iterate fast (~3h).
             SMOKE="${SMOKE:-0}"
             if [ "$SMOKE" = "1" ]; then
                 STAGE1_EPOCHS=2; WARMUP=2; STAGE2_EPOCHS=4; REFRESH=2
             else
-                STAGE1_EPOCHS=50; WARMUP=20; STAGE2_EPOCHS=200; REFRESH=5
+                # WARMUP=0: even 1 warmup epoch fused c5/c7 (New 0.857->0.702). The untrained
+                # Stage-1 rep keeps all 5 novel classes separated -> estimate on it directly.
+                STAGE1_EPOCHS=50; WARMUP=0; STAGE2_EPOCHS=30; REFRESH=2
             fi
+
+            # ---- ESTIMATION-ONLY: warmup -> freeze -> one E-step (DPMM fixes 2+3) -> eval ----
+            #      No Phase-2 joint loop / no DPMM->representation M-step.
+            FREEZE_BACKBONE="True"
+            CBL_LR="1e-3"          # CBL LR when frozen (0.1 diverges!)
+            ALPHA_FIDELITY="0.5"
+            NOVELTY_ALPHA="0.2"
+            TAU_MODE="empirical"     # fix #2 ON  (data-calibrated gate)
+            PCL_KNOWN_UNLAB_W="1.0"  # (irrelevant here)
+            NORM_D2_BY_C="True"      # live L_CL, d^2/C
+            PCL_WEIGHT="1.0"         # keep L_PCL(gt) in the labelled warmup (the 0.784->0.835 lift)
+            GRAD_CLIP="1.0"        # safety net against blow-ups
+            ESTIMATION_ONLY="True"   # warmup then freeze; no joint loop
+            DPMM_COV_SCALE="1.0"     # fix #3 OFF — a merge error argues against s>1 here
+            DPMM_ALPHA="1.0"         # sweep 0.3 / 0.1 in follow-up runs
+            DPMM_SEED="42"           # DPMM Gibbs seed (was silently 0)
+            # fix #2 cleanup, calibrated from the log-only run:
+            #   leak cluster d2_nearest_known=0.7 vs every real novel >=13 -> scale 0.1 (tau*0.1
+            #   ~=5.8) catches the leak, spares all novels. scale 1.0 would absorb 4 real novels.
+            DPMM_ABSORB="True"
+            DPMM_MERGE="False"       # novel centroids packed 19-45; no safe merge threshold
+            ABSORB_SCALE="0.1"       # absorb if d2(centroid, nearest known) < scale*tau
+            MERGE_SCALE="1.0"        # (unused while merge off)
+            S2_EXP="stage2_estonly_absorb01_w0"
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -98,9 +125,10 @@ spec:
             # ============================================================
             # xGCD — Stage 2: joint novel-class discovery + GCD
             # ============================================================
-            S2_OUT="exp/stage2_xgcd_${DATASET}"
+            S2_OUT="exp/${S2_EXP}"
             echo "=========================================="
-            echo "Stage 2: xGCD | warmup=$WARMUP joint_epochs=$STAGE2_EPOCHS refresh=$REFRESH"
+            echo "Stage 2 (Run 1): xGCD | warmup=$WARMUP joint=$STAGE2_EPOCHS refresh=$REFRESH"
+            echo "  freeze_backbone=$FREEZE_BACKBONE alpha_fidelity=$ALPHA_FIDELITY novelty_alpha=$NOVELTY_ALPHA"
             echo "=========================================="
             python -m methods.contrastive_training.xgcd \
                 --dataset_name "$DATASET" \
@@ -111,13 +139,28 @@ spec:
                 --epochs "$STAGE2_EPOCHS" \
                 --refresh_period "$REFRESH" \
                 --lambda_warmup 20 \
-                --novelty_alpha 0.05 \
-                --alpha_fidelity 0.1 \
+                --freeze_backbone "$FREEZE_BACKBONE" \
+                --cbl_lr "$CBL_LR" \
+                --novelty_alpha "$NOVELTY_ALPHA" \
+                --tau_mode "$TAU_MODE" \
+                --alpha_fidelity "$ALPHA_FIDELITY" \
+                --pcl_known_unlab_weight "$PCL_KNOWN_UNLAB_W" \
+                --norm_d2_by_c "$NORM_D2_BY_C" \
+                --pcl_weight "$PCL_WEIGHT" \
+                --grad_clip "$GRAD_CLIP" \
+                --estimation_only "$ESTIMATION_ONLY" \
+                --dpmm_cov_scale "$DPMM_COV_SCALE" \
+                --dpmm_alpha "$DPMM_ALPHA" \
+                --dpmm_seed "$DPMM_SEED" \
+                --dpmm_absorb "$DPMM_ABSORB" \
+                --dpmm_merge "$DPMM_MERGE" \
+                --absorb_scale "$ABSORB_SCALE" \
+                --merge_scale "$MERGE_SCALE" \
                 --lr 0.1 \
                 --cbl_lr_divisor 100 \
                 --batch_size 128 \
                 --num_workers 4 \
-                --exp_name "stage2_xgcd_${DATASET}" \
+                --exp_name "$S2_EXP" \
                 --use_wandb True \
                 --wandb_project "$WANDB_PROJECT" \
                 --wandb_entity "$WANDB_ENTITY"
@@ -147,13 +190,13 @@ spec:
           mountPath: /dev/shm
         resources:
           requests:
-            memory: "32Gi"
+            memory: "16Gi"
             cpu: "4"
-            nvidia.com/rtxa6000: 1
+            nvidia.com/gpu: 1
           limits:
-            memory: "32Gi"
+            memory: "16Gi"
             cpu: "4"
-            nvidia.com/rtxa6000: 1
+            nvidia.com/gpu: 1
         env:
         - name: WANDB_API_KEY
           value: "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"

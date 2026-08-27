@@ -37,7 +37,7 @@ class DPMMResult:
 class DPMM:
     def __init__(self, alpha: float = 1.0, beta: float = 1.0, n_sweeps: int = 30,
                  max_points: Optional[int] = 8000, patience: int = 3,
-                 min_cluster_size: int = 10, seed: int = 0):
+                 min_cluster_size: int = 10, seed: int = 42):
         self.alpha = alpha
         self.beta = beta
         self.n_sweeps = n_sweeps
@@ -48,7 +48,12 @@ class DPMM:
 
     # ------------------------------------------------------------------ fit
     @torch.no_grad()
-    def fit(self, logits_pool: torch.Tensor, lda, m0: Optional[torch.Tensor] = None) -> DPMMResult:
+    def fit(self, logits_pool: torch.Tensor, lda, m0: Optional[torch.Tensor] = None,
+            cov_scale: float = 1.0) -> DPMMResult:
+        # cov_scale (s) replaces Sigma -> s*Sigma throughout Stage B by multiplying every
+        # scalar covariance factor by s (component, base measure, new-table). s scales the
+        # prior AND likelihood, so it cancels in the Normal-Normal mean -> means unchanged.
+        # The C*log(scale) terms pick up the log-det correction automatically (no extra term).
         g = torch.Generator(device="cpu").manual_seed(self.seed)
         X_full = logits_pool.float().cpu()
         N_full, C = X_full.shape
@@ -67,7 +72,7 @@ class DPMM:
 
         log_alpha = math.log(self.alpha)
         const = C * math.log(2.0 * math.pi) + float(lda_cpu.logdet)
-        new_scale = 1.0 + self.beta
+        new_scale = cov_scale * (1.0 + self.beta)   # new-table predictive: (1+beta)*s*Sigma
         # new-component predictive log N(x | m0, (1+beta)Sigma)
         maha_new = lda_cpu.mahalanobis_sq(X, m0.unsqueeze(0)).squeeze(1)  # [N]
         logp_new = -0.5 * (const + C * math.log(new_scale) + maha_new / new_scale)
@@ -82,7 +87,7 @@ class DPMM:
             S = torch.stack(sums) if sums else torch.zeros(0, C)     # [K, C]
             denom = (1.0 + self.beta * Nk).unsqueeze(1)              # [K,1]
             mu = (m0.unsqueeze(0) + self.beta * S) / denom           # [K, C] (Eq 11)
-            s = 1.0 + self.beta / (1.0 + self.beta * Nk)             # [K]
+            s = cov_scale * (1.0 + self.beta / (1.0 + self.beta * Nk))  # [K] existing-comp scale
             return mu, s, Nk
 
         def add(i, k):
@@ -139,14 +144,16 @@ class DPMM:
         # relabel to contiguous ids and build final means over the (subsampled) pool
         z, counts_t, means = _finalize(z, X, counts, sums, self.beta, m0)
 
-        # prune spurious sub-threshold clusters (dissolve, reassign to nearest surviving)
-        if self.min_cluster_size > 1 and means.shape[0] > 1:
+        # prune spurious sub-threshold clusters (dissolve, reassign to nearest surviving).
+        # fix #2: floor min size at 1% of the pool (kills micro-fragments 10 lets through).
+        min_size = max(self.min_cluster_size, int(0.01 * N))
+        if min_size > 1 and means.shape[0] > 1:
             k_before = means.shape[0]
             z, means, counts_t = _prune_small(
-                z, X, means, self.beta, m0, lda_cpu, self.min_cluster_size)
+                z, X, means, self.beta, m0, lda_cpu, min_size)
             if means.shape[0] != k_before:
                 logger.info(f"DPMM pruned {k_before}->{means.shape[0]} clusters "
-                            f"(min_cluster_size={self.min_cluster_size})")
+                            f"(min_size={min_size})")
 
         # if we subsampled, assign the held-out pool points to nearest final mean
         if N < N_full:
