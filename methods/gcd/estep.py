@@ -11,6 +11,7 @@ representation, the prototype set and cluster assignments the M-step trains agai
 Prototypes = [known mu_k (0..K^l-1)] ++ [novel means (K^l..K^l+K^n-1)].
 Assignments for every unlabelled sample: its known cluster id, or K^l + its novel id.
 """
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -108,7 +109,7 @@ def _log_cluster_composition(cluster_ids: torch.Tensor, gt_labels: torch.Tensor,
                 f"split novel classes={splits} | leak clusters (idx)={leaks}")
 
 
-def _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args):
+def _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args, verbose=True):
     """Cluster-level cleanup of the raw DPMM output (fix #2, cluster level). Three passes:
 
       pass 1 absorb: a novel cluster whose CENTROID sits in the known region — nearest
@@ -161,11 +162,12 @@ def _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args):
     absorbed = torch.zeros(K, dtype=torch.bool, device=dev)
     if do_absorb:
         absorbed = (nn_known_d < absorb_tau) & (nn_known_d < nn_nov_d)
-    for k in range(K):
-        tagk = f"ABSORB->known-c{int(nn_known_j[k])}" if bool(absorbed[k]) else "keep"
-        logger.info(f"[absorb] cluster {k}: d2_nearest_known={float(nn_known_d[k]):.1f} "
-                    f"(c{int(nn_known_j[k])})  d2_nearest_novel={float(nn_nov_d[k]):.1f}  "
-                    f"absorb_tau={absorb_tau:.1f} -> {tagk}")
+    if verbose:
+        for k in range(K):
+            tagk = f"ABSORB->known-c{int(nn_known_j[k])}" if bool(absorbed[k]) else "keep"
+            logger.info(f"[absorb] cluster {k}: d2_nearest_known={float(nn_known_d[k]):.1f} "
+                        f"(c{int(nn_known_j[k])})  d2_nearest_novel={float(nn_nov_d[k]):.1f}  "
+                        f"absorb_tau={absorb_tau:.1f} -> {tagk}")
 
     # ---- pass 2: complete-linkage merge among survivors ----
     groups = [[k] for k in range(K) if not bool(absorbed[k])]
@@ -177,8 +179,9 @@ def _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args):
                 for j in range(i + 1, len(groups)):
                     cross = [float(d_nov[a, b]) for a in groups[i] for b in groups[j]]
                     if cross and max(cross) < merge_tau:   # complete linkage
-                        logger.info(f"[merge] groups {groups[i]} + {groups[j]} "
-                                    f"max_d2={max(cross):.1f} < merge_tau={merge_tau:.1f}")
+                        if verbose:
+                            logger.info(f"[merge] groups {groups[i]} + {groups[j]} "
+                                        f"max_d2={max(cross):.1f} < merge_tau={merge_tau:.1f}")
                         groups[i] = groups[i] + groups[j]
                         groups.pop(j)
                         changed = True
@@ -197,8 +200,9 @@ def _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args):
         for gi, g in enumerate(groups):
             if len(g) > 1 and bool(gnn_d[gi] < absorb_tau) and bool(gnn_d[gi] < gnn_nov[gi]):
                 absorbed_group[gi] = int(gnn_j[gi])
-                logger.info(f"[absorb/post-merge] group {g} centroid d2_known={float(gnn_d[gi]):.1f}"
-                            f"(c{int(gnn_j[gi])}) d2_novel={float(gnn_nov[gi]):.1f} -> ABSORB")
+                if verbose:
+                    logger.info(f"[absorb/post-merge] group {g} centroid d2_known={float(gnn_d[gi]):.1f}"
+                                f"(c{int(gnn_j[gi])}) d2_novel={float(gnn_nov[gi]):.1f} -> ABSORB")
 
     # ---- assemble: known ids for absorbed, contiguous novel ids for survivors ----
     final_groups = [g for gi, g in enumerate(groups) if gi not in absorbed_group]
@@ -218,8 +222,9 @@ def _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args):
 
     n_pass1 = int(absorbed.sum())
     n_merged = len([k for g in groups for k in g]) - len(groups)   # clusters folded by merge
-    logger.info(f"[absorb-merge] K^n {K} -> {len(final_groups)} (pass1-absorbed {n_pass1}, "
-                f"merged {n_merged}, post-merge-absorbed {len(absorbed_group)})")
+    if verbose:
+        logger.info(f"[absorb-merge] K^n {K} -> {len(final_groups)} (pass1-absorbed {n_pass1}, "
+                    f"merged {n_merged}, post-merge-absorbed {len(absorbed_group)})")
     return new_means, pool_ids
 
 
@@ -256,6 +261,89 @@ def _fit_dpmm(pool, lda, m0, args, dpmm_kwargs):
     return dp, s, s_meas
 
 
+def _collapsed_joint(pool, dp, lda, alpha, cov_scale=1.0):
+    """Label-free DPMM model-selection score (draft App A). Returns (collapsed_joint, avg_ld):
+      - avg_ld  = mean_i log N(ell_i | mu_{z_i}, s*Sigma) — fair to compare WITHIN a fixed K.
+      - collapsed_joint = CRP log-prior + sum_i log-density — comparable ACROSS K, because the
+        CRP prior penalises opening tables (bare density always rises with K). This is the
+        model's own posterior over partitions, so it arbitrates the split-mode consensus.
+    Uses only logits + the fit + Sigma (no labels)."""
+    X = pool.detach().cpu().float()
+    N, C = X.shape
+    z = dp.assignments.cpu()
+    means = dp.means.cpu().float()
+    prec = lda.precision.detach().cpu().float()
+    counts = torch.bincount(z, minlength=means.shape[0]).float()
+    nz = counts[counts > 0]
+    K = len(nz)
+    # CRP log-prior: p(z) = alpha^K * Gamma(alpha)/Gamma(alpha+N) * prod_k Gamma(N_k)
+    crp = (K * math.log(alpha) + math.lgamma(alpha) - math.lgamma(alpha + N)
+           + torch.lgamma(nz).sum().item())
+    # data log-likelihood under the fit (shared Sigma, scaled by s)
+    diff = X - means[z]                                          # [N, C]
+    maha = torch.einsum("nc,cd,nd->n", diff, prec, diff).clamp_min(0.0)
+    const = C * math.log(2.0 * math.pi) + float(lda.logdet) + C * math.log(cov_scale)
+    ll = float((-0.5 * (const + maha / cov_scale)).sum())
+    return crp + ll, ll / max(N, 1)
+
+
+def _dpmm_consensus(pool, lda, m0, args, dpmm_kwargs, tau, k_known):
+    """Run the DPMM over N seeds on the SAME pool; freeze the consensus fit (draft: raw K^n
+    is seed-sensitive, so a single seed bakes in luck). Per-seed pipeline, ORDER MATTERS:
+      DPMM -> absorb (distance-to-known: catches coherent known-LEAKS) -> peak-gate (concept
+      peak sigma(mu): catches incoherent JUNK, far from every known so absorb ignores it).
+    The two filters catch OPPOSITE failure modes; neither does the other's job. Consensus
+    votes on the GRADUATED count (post-absorb clusters whose prototype peak >= peak_thresh),
+    which the coherence gate stabilises against junk-driven variance. CAVEAT logged for
+    honesty: gating removes junk only — clean splits (two coherent horse clusters) and
+    under-merges (K too small) survive it, so raw/absorb/graduated distributions are all
+    printed. Tie-break: clear mode -> highest avg log-density; split -> collapsed joint.
+    Returns the winning seed's dict."""
+    from collections import Counter
+    n_seeds = int(getattr(args, "dpmm_seeds", 1))
+    base = int(dpmm_kwargs.get("seed", 42))
+    dpmm_a = float(dpmm_kwargs.get("alpha", 1.0))
+    peak_thresh = float(getattr(args, "peak_thresh", 0.80))
+    results = []
+    for i in range(n_seeds):
+        kw = dict(dpmm_kwargs); kw["seed"] = base + i
+        dp, s_app, s_meas = _fit_dpmm(pool, lda, m0, args, kw)
+        nm, _pid = _absorb_and_merge(dp, pool, lda, m0, k_known, tau, args, verbose=False)
+        joint, avg_ld = _collapsed_joint(pool, dp, lda, dpmm_a, cov_scale=s_app)
+        # peak-activation coherence gate (AFTER absorb): max sigma(mu) per novel prototype.
+        peaks = torch.sigmoid(nm).max(dim=1).values.cpu() if nm.shape[0] else torch.zeros(0)
+        grad_k = int((peaks >= peak_thresh).sum())
+        results.append(dict(seed=base + i, dp=dp, s_app=s_app, s_meas=s_meas,
+                            k_absorb=nm.shape[0], grad_k=grad_k, joint=joint, avg_ld=avg_ld))
+        peak_str = ",".join(f"{float(p):.2f}" for p in peaks)
+        logger.info(f"[consensus] seed={base + i}: K_raw={dp.n_components} K_absorb={nm.shape[0]} "
+                    f"K_grad={grad_k} peaks=[{peak_str}] joint={joint:.1f} avg_ld={avg_ld:.3f}")
+        for p in peaks:                                          # flag ambiguous coherence
+            if 0.75 <= float(p) <= 0.85:
+                logger.warning(f"[consensus] seed={base + i}: AMBIGUOUS peak {float(p):.3f} "
+                               f"in [0.75,0.85] (near peak_thresh={peak_thresh})")
+
+    # consensus over GRADUATED-K (the coherence-stabilised count)
+    gcounts = Counter(r["grad_k"] for r in results)
+    ranked = gcounts.most_common()
+    split = len(ranked) > 1 and ranked[0][1] == ranked[1][1]     # no strict majority
+    if split:
+        winner = max(results, key=lambda r: r["joint"])          # across-K: CRP-penalised joint
+        logger.warning(f"[consensus] SPLIT graduated-K {dict(gcounts)} -> tie-break by collapsed "
+                       f"joint -> seed={winner['seed']} K_grad={winner['grad_k']}")
+    else:
+        mode_k = ranked[0][0]
+        cand = [r for r in results if r["grad_k"] == mode_k]
+        winner = max(cand, key=lambda r: r["avg_ld"])            # within-K: avg log-density
+        logger.info(f"[consensus] graduated-K {dict(gcounts)} -> mode K_grad={mode_k} "
+                    f"({ranked[0][1]}/{n_seeds}) -> seed={winner['seed']}")
+    # full picture (caveat made visible): how much of the raw variance the gate removed
+    logger.info(f"[consensus] distributions | raw-K={dict(Counter(r['dp'].n_components for r in results))} "
+                f"absorb-K={dict(Counter(r['k_absorb'] for r in results))} "
+                f"graduated-K={dict(gcounts)} (peak_thresh={peak_thresh})")
+    return winner
+
+
 def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
               unlab_logits: torch.Tensor, args, unlab_labels: torch.Tensor = None) -> EStepResult:
     alpha = getattr(args, "novelty_alpha", 0.05)
@@ -268,6 +356,8 @@ def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
     dpmm_min_cluster = getattr(args, "dpmm_min_cluster_size", 10)
     min_novel = getattr(args, "dpmm_min_pool", 10)
     dpmm_seed = getattr(args, "dpmm_seed", 42)
+    dpmm_seeds = int(getattr(args, "dpmm_seeds", 1))
+    dpmm_patience = int(getattr(args, "dpmm_patience", 3))
 
     # 1. known-class geometry
     lda = LDAGaussian(ridge_gamma=ridge).fit(labelled_logits, labelled_labels)
@@ -340,8 +430,13 @@ def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
         m0 = unlab_logits.mean(0)                  # empirical-Bayes base-measure mean
         dpmm_kwargs = dict(alpha=dpmm_alpha, beta=dpmm_beta, n_sweeps=dpmm_sweeps,
                            max_points=dpmm_max_pts, min_cluster_size=dpmm_min_cluster,
-                           seed=dpmm_seed)
-        dp, s_applied, s_measured = _fit_dpmm(pool, lda, m0, args, dpmm_kwargs)
+                           patience=dpmm_patience, seed=dpmm_seed)
+        if dpmm_seeds > 1:
+            # 5-seed consensus (K is seed-sensitive): freeze the modal post-cleanup K^n.
+            win = _dpmm_consensus(pool, lda, m0, args, dpmm_kwargs, tau, k_known)
+            dp, s_applied, s_measured = win["dp"], win["s_app"], win["s_meas"]
+        else:
+            dp, s_applied, s_measured = _fit_dpmm(pool, lda, m0, args, dpmm_kwargs)
         pool_gt = unlab_labels[nov.novel_idx].cpu() if unlab_labels is not None else None
 
         # GT-based over-spread check (diagnosis only): the s a PERFECT novel clustering would

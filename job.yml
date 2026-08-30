@@ -80,7 +80,10 @@ spec:
             ESTIMATION_ONLY="True"   # warmup then freeze; no joint loop
             DPMM_COV_SCALE="1.0"     # fix #3 OFF — a merge error argues against s>1 here
             DPMM_ALPHA="1.0"         # sweep 0.3 / 0.1 in follow-up runs
-            DPMM_SEED="42"           # DPMM Gibbs seed (was silently 0)
+            DPMM_SEED="42"           # single best seed — this is the frozen state for Phase 3
+            DPMM_SEEDS="1"           # 1 = single seed, no consensus (kept simple)
+            DPMM_SWEEPS="30"         # default (patience-8/sweeps-60 experiment over-segmented)
+            DPMM_PATIENCE="3"        # default (bump caused over-splitting; reverted on model-behavior grounds)
             # fix #2 cleanup, calibrated from the log-only run:
             #   leak cluster d2_nearest_known=0.7 vs every real novel >=13 -> scale 0.1 (tau*0.1
             #   ~=5.8) catches the leak, spares all novels. scale 1.0 would absorb 4 real novels.
@@ -88,7 +91,7 @@ spec:
             DPMM_MERGE="False"       # novel centroids packed 19-45; no safe merge threshold
             ABSORB_SCALE="0.1"       # absorb if d2(centroid, nearest known) < scale*tau
             MERGE_SCALE="1.0"        # (unused while merge off)
-            S2_EXP="stage2_estonly_absorb01_w0"
+            S2_EXP="stage2_estonly_seed42"
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -152,6 +155,9 @@ spec:
                 --dpmm_cov_scale "$DPMM_COV_SCALE" \
                 --dpmm_alpha "$DPMM_ALPHA" \
                 --dpmm_seed "$DPMM_SEED" \
+                --dpmm_seeds "$DPMM_SEEDS" \
+                --dpmm_sweeps "$DPMM_SWEEPS" \
+                --dpmm_patience "$DPMM_PATIENCE" \
                 --dpmm_absorb "$DPMM_ABSORB" \
                 --dpmm_merge "$DPMM_MERGE" \
                 --absorb_scale "$ABSORB_SCALE" \
@@ -191,11 +197,11 @@ spec:
         resources:
           requests:
             memory: "16Gi"
-            cpu: "4"
+            cpu: "2"
             nvidia.com/gpu: 1
           limits:
             memory: "16Gi"
-            cpu: "4"
+            cpu: "2"
             nvidia.com/gpu: 1
         env:
         - name: WANDB_API_KEY
