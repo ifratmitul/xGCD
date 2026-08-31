@@ -423,10 +423,7 @@ def get_xgcd_parser():
     p.add_argument("--dpmm_max_points", type=int, default=8000)
     p.add_argument("--dpmm_min_cluster_size", type=int, default=10)
     p.add_argument("--dpmm_min_pool", type=int, default=10)
-    p.add_argument("--dpmm_seed", type=int, default=42, help="DPMM Gibbs base seed")
-    p.add_argument("--dpmm_seeds", type=int, default=1,
-                   help="consensus over N seeds (seed..seed+N-1) on the same pool; freeze the "
-                        "modal graduated-K. Tie-break: within-K avg log-density, across-K collapsed joint")
+    p.add_argument("--dpmm_seed", type=int, default=42, help="DPMM Gibbs seed")
     p.add_argument("--dpmm_patience", type=int, default=3,
                    help="DPMM: stop after K^n stable this many sweeps (raise to reduce premature-convergence variance)")
     p.add_argument("--peak_thresh", type=float, default=0.80,
