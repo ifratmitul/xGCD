@@ -80,7 +80,9 @@ spec:
             ESTIMATION_ONLY="True"   # warmup then freeze; no joint loop
             DPMM_COV_SCALE="1.0"     # fix #3 OFF — a merge error argues against s>1 here
             DPMM_ALPHA="1.0"         # sweep 0.3 / 0.1 in follow-up runs
-            DPMM_SEED="42"           # DPMM Gibbs seed (was silently 0)
+            DPMM_SEED="42"           # single best seed — this is the frozen state for Phase 3
+            DPMM_SWEEPS="30"         # default (patience-8/sweeps-60 experiment over-segmented)
+            DPMM_PATIENCE="3"        # default (bump caused over-splitting; reverted on model-behavior grounds)
             # fix #2 cleanup, calibrated from the log-only run:
             #   leak cluster d2_nearest_known=0.7 vs every real novel >=13 -> scale 0.1 (tau*0.1
             #   ~=5.8) catches the leak, spares all novels. scale 1.0 would absorb 4 real novels.
@@ -88,7 +90,16 @@ spec:
             DPMM_MERGE="False"       # novel centroids packed 19-45; no safe merge threshold
             ABSORB_SCALE="0.1"       # absorb if d2(centroid, nearest known) < scale*tau
             MERGE_SCALE="1.0"        # (unused while merge off)
-            S2_EXP="stage2_estonly_absorb01_w0"
+            S2_EXP="stage2_estonly_seed42"
+
+            # ---- Phase 3: parametric CE refinement on the frozen estimate ----
+            PEAK_GATE="True"         # coherence gate ON for cifar10 (toggle OFF for new datasets)
+            CE_WEIGHT="1.0"
+            HEAD_LR="1e-2"           # fresh head -> higher LR (CBL stays at CBL_LR=1e-3)
+            LABELLED_WARMUP="0"      # epochs of labelled-only CE before trusting pseudo-labels
+            CONF_TEMP="0.0"          # 0 = use C (concept count) as the confidence softmax temperature
+            P3_EPOCHS="15"
+            P3_EXP="phase3_cifar10"
 
             echo "=========================================="
             echo "Stage 1: CBL pre-training | dataset=$DATASET epochs=$STAGE1_EPOCHS smoke=$SMOKE"
@@ -123,53 +134,50 @@ spec:
             ls -la "$CBL_OUT" 2>/dev/null || true
 
             # ============================================================
-            # xGCD — Stage 2: joint novel-class discovery + GCD
+            # xGCD — Phase 3: parametric CE refinement on the frozen estimate
+            #   (runs the seed-42 estimation internally, then trains the head + CBL)
             # ============================================================
-            S2_OUT="exp/${S2_EXP}"
+            S3_OUT="exp/${P3_EXP}"
             echo "=========================================="
-            echo "Stage 2 (Run 1): xGCD | warmup=$WARMUP joint=$STAGE2_EPOCHS refresh=$REFRESH"
-            echo "  freeze_backbone=$FREEZE_BACKBONE alpha_fidelity=$ALPHA_FIDELITY novelty_alpha=$NOVELTY_ALPHA"
+            echo "Phase 3: CE refinement | peak_gate=$PEAK_GATE epochs=$P3_EPOCHS head_lr=$HEAD_LR warmup=$LABELLED_WARMUP"
             echo "=========================================="
-            python -m methods.contrastive_training.xgcd \
+            python -m methods.contrastive_training.phase3 \
                 --dataset_name "$DATASET" \
                 --cbl_dir "$CBL_OUT" \
                 --prop_train_labels 0.5 \
                 --concept_conf_threshold "$CONF_THR" \
-                --warmup_epochs "$WARMUP" \
-                --epochs "$STAGE2_EPOCHS" \
+                --epochs "$P3_EPOCHS" \
                 --refresh_period "$REFRESH" \
-                --lambda_warmup 20 \
-                --freeze_backbone "$FREEZE_BACKBONE" \
                 --cbl_lr "$CBL_LR" \
+                --alpha_fidelity "$ALPHA_FIDELITY" \
+                --grad_clip "$GRAD_CLIP" \
                 --novelty_alpha "$NOVELTY_ALPHA" \
                 --tau_mode "$TAU_MODE" \
-                --alpha_fidelity "$ALPHA_FIDELITY" \
-                --pcl_known_unlab_weight "$PCL_KNOWN_UNLAB_W" \
-                --norm_d2_by_c "$NORM_D2_BY_C" \
-                --pcl_weight "$PCL_WEIGHT" \
-                --grad_clip "$GRAD_CLIP" \
-                --estimation_only "$ESTIMATION_ONLY" \
                 --dpmm_cov_scale "$DPMM_COV_SCALE" \
                 --dpmm_alpha "$DPMM_ALPHA" \
                 --dpmm_seed "$DPMM_SEED" \
                 --dpmm_absorb "$DPMM_ABSORB" \
                 --dpmm_merge "$DPMM_MERGE" \
                 --absorb_scale "$ABSORB_SCALE" \
-                --merge_scale "$MERGE_SCALE" \
-                --lr 0.1 \
-                --cbl_lr_divisor 100 \
+                --peak_gate "$PEAK_GATE" \
+                --peak_thresh 0.80 \
+                --ce_weight "$CE_WEIGHT" \
+                --head_lr "$HEAD_LR" \
+                --labelled_warmup "$LABELLED_WARMUP" \
+                --conf_temp "$CONF_TEMP" \
+                --ref_acc 0.8707 \
                 --batch_size 128 \
                 --num_workers 4 \
-                --exp_name "$S2_EXP" \
+                --exp_name "$P3_EXP" \
                 --use_wandb True \
                 --wandb_project "$WANDB_PROJECT" \
                 --wandb_entity "$WANDB_ENTITY"
 
             echo ""
             echo "=========================================="
-            echo "xGCD PIPELINE COMPLETED — Stage1: $CBL_OUT | Stage2: $S2_OUT"
+            echo "xGCD PIPELINE COMPLETED — Stage1: $CBL_OUT | Phase3: $S3_OUT"
             echo "=========================================="
-            ls -la "$S2_OUT" 2>/dev/null || true
+            ls -la "$S3_OUT" 2>/dev/null || true
 
             # Sync any offline wandb runs (no-op when logged online)
             if [ -d "logs/wandb" ]; then
@@ -191,12 +199,12 @@ spec:
         resources:
           requests:
             memory: "16Gi"
-            cpu: "4"
-            nvidia.com/gpu: 1
+            cpu: "2"
+            nvidia.com/rtxa6000: 1
           limits:
             memory: "16Gi"
-            cpu: "4"
-            nvidia.com/gpu: 1
+            cpu: "2"
+            nvidia.com/rtxa6000: 1
         env:
         - name: WANDB_API_KEY
           value: "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"
