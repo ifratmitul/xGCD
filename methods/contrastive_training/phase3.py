@@ -78,6 +78,14 @@ def _eval(model, head, loader, prototypes, lda, k_lab, k_total, k_true, device, 
 
 def run_phase3(args):
     device = get_device()
+    # reproducible CE refinement: without this the head/CBL training is unseeded and the
+    # final All/Old/New vary run-to-run (K is already fixed by the seeded estimation).
+    seed = int(getattr(args, "seed", 42))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    logger.info(f"[phase3] seeded: seed={seed} (cudnn.deterministic=True)")
     configure_splits(args)
     args.total_classes = args.num_labeled_classes + args.num_unlabeled_classes
 
@@ -106,8 +114,9 @@ def run_phase3(args):
 
     lab_loader = DataLoader(lab_extract, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     unlab_loader = DataLoader(unlab_extract, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    merge_gen = torch.Generator().manual_seed(seed)   # shuffle depends only on the seed
     merged_train = DataLoader(merged, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, drop_last=True)
+                              num_workers=args.num_workers, drop_last=True, generator=merge_gen)
 
     # ---- 1. frozen discovery estimate (single E-step; deterministic seed) ----
     model.eval()
@@ -257,6 +266,8 @@ def get_phase3_parser():
     p.add_argument("--old_drop_stop", type=float, default=0.05, help="canary: warn if Old-ACC drops by more")
     p.add_argument("--ref_acc", type=float, default=0.8707,
                    help="frozen-pipeline reference All-ACC to beat (for the comparison chain)")
+    p.add_argument("--seed", type=int, default=42,
+                   help="seed for reproducible CE refinement (shuffle + init + cudnn deterministic)")
     return p
 
 
