@@ -42,7 +42,7 @@ def extract_concept_logits(model, loader, device):
     model.eval()
     logits, labels, uqs, masks = [], [], [], []
     have_mask = True
-    for batch in tqdm(loader, desc="extract logits", leave=False):
+    for batch in loader:
         img, label, uq, mask = _unpack(batch)
         ell = model(img.to(device))
         logits.append(ell.detach().cpu())

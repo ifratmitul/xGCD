@@ -77,6 +77,10 @@ def _eval(model, head, loader, prototypes, lda, k_lab, k_total, k_true, device, 
 
 
 def run_phase3(args):
+    logger.info("Args:")
+    for k, v in sorted(vars(args).items()):
+        logger.info(f"  {k}={v}")
+
     device = get_device()
     configure_splits(args)
     args.total_classes = args.num_labeled_classes + args.num_unlabeled_classes

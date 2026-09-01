@@ -192,6 +192,10 @@ def _get_datasets(args, transform):
 
 
 def run_stage1(args):
+    logger.info("Args:")
+    for k, v in sorted(vars(args).items()):
+        logger.info(f"  {k}={v}")
+
     device = get_device()
     logger.info(f"Stage 1 device: {device}")
 
