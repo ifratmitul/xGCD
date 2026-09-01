@@ -94,7 +94,11 @@ def train_cbl_on_features(cbl, feats, targets, pos_weight, args, device,
                           val_feats=None, val_targets=None, wandb_run=None):
     cbl = cbl.to(device)
     ds = TensorDataset(feats, targets)
-    loader = DataLoader(ds, batch_size=args.cbl_batch_size, shuffle=True, drop_last=False)
+    # Explicit generator so the shuffle depends ONLY on the seed, isolated from any other
+    # global-RNG consumption (model init, etc.). Same seed -> same shuffle -> same CBL.
+    g = torch.Generator().manual_seed(int(getattr(args, "seed", 0)))
+    loader = DataLoader(ds, batch_size=args.cbl_batch_size, shuffle=True,
+                        drop_last=False, generator=g)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     optim = torch.optim.Adam(cbl.parameters(), lr=args.cbl_lr, weight_decay=args.cbl_weight_decay)
     grad_clip = getattr(args, "grad_clip", 0.0)
@@ -195,6 +199,16 @@ def run_stage1(args):
     device = get_device()
     logger.info(f"Stage 1 device: {device}")
 
+    # reproducible CBL: without this, training is unseeded and every run yields a DIFFERENT
+    # cbl_stage1.pt -> different concept logits -> completely different downstream results.
+    seed = getattr(args, "seed", 0)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    logger.info(f"Stage 1 seeded: seed={seed} (cudnn.deterministic=True)")
+
     configure_splits(args)
     transform = _build_transforms(args)
     datasets = _get_datasets(args, transform)
@@ -288,6 +302,8 @@ def get_stage1_parser():
     p.add_argument("--prop_train_labels", type=float, default=0.5)
     p.add_argument("--concept_conf_threshold", type=float, default=0.15)
     p.add_argument("--rebuild_vocab", type=str2bool, default=False)
+    p.add_argument("--seed", type=int, default=0,
+                   help="seed for reproducible CBL training (shuffle + init + cudnn deterministic)")
     # model
     p.add_argument("--model_arch", type=str, default="vit_base")
     p.add_argument("--grad_from_block", type=int, default=11)

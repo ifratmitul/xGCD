@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: xgcd-debug2
+  name: xgcd-debug
   namespace: longweiwangusd
 spec:
   containers:
