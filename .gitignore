@@ -67,3 +67,4 @@ exp/
 
 
 *.slurm
+*.bash
