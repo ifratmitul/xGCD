@@ -9,7 +9,8 @@ FIXED class set. No DPMM / gate in the loop, so K cannot oscillate.
     few epochs so early mistakes get corrected as ell sharpens).
   * confidence weighting on temperature-scaled logits (head logits are Mahalanobis-scale, so
     a raw softmax saturates to one-hot -> the weight would silently be a no-op).
-  * loss = CE + alpha_f * BCE.  L_CL / L_PCL are dropped (CE replaces them).
+  * loss = CE + alpha_f * BCE (+ anchor_weight * L_anchor if --anchor_loss).  L_CL / L_PCL
+    are dropped (CE replaces them).
   * canaries: logit_std (divergence), Old-ACC (known-boundary erosion), refresh confidences.
   * eval both ways every refresh: head-argmax (headline) and nearest-prototype (monitor),
     against the frozen reference number.
@@ -29,6 +30,7 @@ from data.splits import configure_splits
 from methods.contrastive_training.extract import extract_concept_logits
 from methods.contrastive_training.stage1_cbl import get_device, init_wandb
 from methods.contrastive_training.xgcd import build_data, get_xgcd_parser
+from methods.contrastive_training.extra_losses import known_concept_anchor_loss
 from methods.gcd.estep import run_estep
 from methods.gcd.losses import fidelity_bce
 from methods.gcd.eval_gcd import assign_to_prototypes, explain_prototype
@@ -128,6 +130,19 @@ def run_phase3(args):
     logger.info(f"[phase3] frozen estimate: K_l={k_known} K_n={res.k_novel} "
                 f"total_prototypes={res.prototypes.shape[0]}")
 
+    # ---- 1b. optional known-concept anchor (OFF by default) ----
+    # Snapshot the CBL HERE, not right after loading Stage-1 weights: the discovered
+    # prototypes/LDA above are only valid for whatever CBL state produced them. Anchoring
+    # here stops the CE+BCE loop below from drifting labelled samples' concept output away
+    # from the representation the fixed prototypes describe.
+    frozen_cbl = None
+    if args.anchor_loss:
+        frozen_cbl = copy.deepcopy(model.cbl).eval().to(device)
+        for p in frozen_cbl.parameters():
+            p.requires_grad_(False)
+        logger.info(f"[phase3] anchor loss ON (weight={args.anchor_weight}) -- CBL snapshotted "
+                    "at the discovery-estimate point")
+
     # ---- 2. peak-activation gate (toggleable) -> the FIXED class set ----
     prototypes = _peak_gate(res.prototypes.to(device), k_known, args.peak_thresh, args.peak_gate)
     k_total = prototypes.shape[0]
@@ -174,10 +189,10 @@ def run_phase3(args):
     for epoch in range(args.epochs):
         labelled_only = epoch < args.labelled_warmup     # stabilise head on GT before self-training
         model.train(); model.backbone.eval(); head.train()
-        agg = dict(ce=0.0, bce=0.0, loss=0.0); nb = 0
+        agg = dict(ce=0.0, bce=0.0, anchor=0.0, loss=0.0); nb = 0
         for images, labels, uq, mask_lab in merged_train:
             x = images[0].to(device)                     # single augmented view (no contrastive term)
-            ell = model(x)
+            feat, ell = model.forward_features(x)
             labels = labels.to(device).long()
             uq = uq.to(device).long()
             mask_lab = mask_lab.reshape(-1).bool().to(device)
@@ -196,7 +211,13 @@ def run_phase3(args):
                 L_bce = fidelity_bce(ell[mask_lab], o, pos_weight)
             else:
                 L_bce = torch.zeros((), device=device)
-            loss = args.ce_weight * L_ce + args.alpha_fidelity * L_bce
+            if frozen_cbl is not None:
+                with torch.no_grad():
+                    frozen_ell = frozen_cbl(feat)
+                L_anchor = known_concept_anchor_loss(ell, frozen_ell, mask_lab)
+            else:
+                L_anchor = torch.zeros((), device=device)
+            loss = args.ce_weight * L_ce + args.alpha_fidelity * L_bce + args.anchor_weight * L_anchor
             if not torch.isfinite(loss):
                 logger.error(f"[phase3] non-finite loss at epoch {epoch+1} — diverged.")
                 raise RuntimeError("Phase 3 diverged.")
@@ -206,7 +227,8 @@ def run_phase3(args):
                 torch.nn.utils.clip_grad_norm_(
                     list(head.parameters()) + list(model.cbl.parameters()), args.grad_clip)
             optimizer.step()
-            agg["ce"] += float(L_ce); agg["bce"] += float(L_bce); agg["loss"] += float(loss); nb += 1
+            agg["ce"] += float(L_ce); agg["bce"] += float(L_bce); agg["anchor"] += float(L_anchor)
+            agg["loss"] += float(loss); nb += 1
         for k in agg:
             agg[k] /= max(nb, 1)
 
@@ -217,7 +239,8 @@ def run_phase3(args):
         m = _eval(model, head, unlab_loader, prototypes, lda, k_known, k_total,
                   args.num_unlabeled_classes, device, "eval", epoch + 1)
         logger.info(f"[phase3] epoch {epoch+1}/{args.epochs} loss={agg['loss']:.4f} "
-                    f"ce={agg['ce']:.4f} bce={agg['bce']:.4f} lab_only={labelled_only}")
+                    f"ce={agg['ce']:.4f} bce={agg['bce']:.4f} anchor={agg['anchor']:.4f} "
+                    f"lab_only={labelled_only}")
         # canaries
         if m["logit_std"] > args.logit_std_stop:
             logger.error(f"[phase3 canary] logit_std={m['logit_std']:.1f} > {args.logit_std_stop} — diverging, stop.")
@@ -227,6 +250,7 @@ def run_phase3(args):
                            f"(drop>{args.old_drop_stop}) — known-boundary erosion (confirmation bias?)")
         if wandb_run is not None:
             wandb_run.log({"phase3/loss": agg["loss"], "phase3/ce": agg["ce"], "phase3/bce": agg["bce"],
+                           "phase3/anchor": agg["anchor"],
                            "phase3/all": m["all"], "phase3/old": m["old"], "phase3/new": m["new"],
                            "phase3/logit_std": m["logit_std"], "phase3/k_hat": k_total - k_known},
                           step=epoch + 1)
@@ -268,6 +292,12 @@ def get_phase3_parser():
                    help="frozen-pipeline reference All-ACC to beat (for the comparison chain)")
     p.add_argument("--seed", type=int, default=42,
                    help="seed for reproducible CE refinement (shuffle + init + cudnn deterministic)")
+    p.add_argument("--anchor_loss", type=str2bool, default=False,
+                   help="pull labelled samples' live CBL output back toward a frozen snapshot "
+                        "taken at the discovery-estimate point, to fight known-concept drift "
+                        "during the CE+BCE training loop (0=off)")
+    p.add_argument("--anchor_weight", type=float, default=1.0,
+                   help="weight on L_anchor when --anchor_loss is on")
     return p
 
 
