@@ -7,51 +7,50 @@
 #SBATCH --mem=128gb
 #SBATCH --time=200:00:00
 #SBATCH --gres=gpu:a100:1
-#SBATCH --output=%j.log
+#SBATCH --output=%j-2.log
 
-set -e
+echo "====================================================="
+pwd; hostname; date
+echo "====================================================="
 
-# ============================================================
-# xGCD — Stage 1 + Phase 3 Pipeline (SLURM)
-# ============================================================
+module load apptainer
 
-echo "=========================================="
-echo "Verifying GPU availability..."
-echo "=========================================="
-nvidia-smi || (echo "ERROR: GPU not accessible!" && exit 1)
+# --- project + container paths (EDIT to match the cluster) --------------------
+PROJECT="/home/mozafarinia/Documents/xGCD"
+CONTAINER="/home/mozafarinia/Documents/xgcd.sif"
+cd "$PROJECT" || { echo "project dir not found: $PROJECT"; exit 1; }
 
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
+nvidia-smi
 
-# Navigate to project directory
-cd /path/to/xGCD  # change this path
+# mkdir -p exp data/datasets logs/wandb
 
-# Initialize conda
-source $CONDA_PREFIX/etc/profile.d/conda.sh  # or your conda path
+# reuse CIFAR-10/100 already downloaded under the main xGCD checkout instead of
+# re-downloading here -- compute nodes have no internet access, so torchvision's
+# download=True fails with a DNS/network error against a fresh, empty datasets dir.
+for ds in cifar10 cifar100; do
+    if [ ! -e "data/datasets/$ds" ] && [ -d "../data/datasets/$ds" ]; then
+        ln -s "$(realpath "../data/datasets/$ds")" "data/datasets/$ds"
+        echo "symlinked data/datasets/$ds -> ../data/datasets/$ds"
+    fi
+done
 
-# Setup environment
-echo "=========================================="
-echo "Running setup.sh..."
-echo "=========================================="
-bash setup.sh
-conda activate xGCD
+# --- verify the environment INSIDE the container -----------------------------
+apptainer exec --nv "$CONTAINER" python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+apptainer exec --nv "$CONTAINER" python -c "import wandb; print('wandb', wandb.__version__)"
 
-# Verify installation
-python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'; print(f'PyTorch {torch.__version__} / CUDA {torch.version.cuda}')"
-python -c "import wandb; print(f'wandb {wandb.__version__}')"
-python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
-
-mkdir -p exp data/datasets logs/wandb
 
 # ============================================================
 # Configuration
 # ============================================================
 DATASET="cifar10"
-EXP_NAME="stage1_cbl_cifar10"
+EXP_NAME="stage1_cbl_cifar10_test2"
 CONF_THR="0.15"
+SEED="42"
 
 WANDB_PROJECT="xGCD"
 WANDB_ENTITY="ifrat-ikhtear-university-of-south-dakota"
 export WANDB_DIR="logs"
+export WANDB_MODE=disabled
 
 # Fast integration run (set SMOKE=0 for full run)
 SMOKE="${SMOKE:-0}"
@@ -62,8 +61,9 @@ else
 fi
 
 # ---- Estimation-only configuration ----
-FREEZE_BACKBONE="True"
+FREEZE_BACKBONE="False"
 CBL_LR="1e-3"
+CBL_LR_DIVISOR="100"
 ALPHA_FIDELITY="0.5"
 NOVELTY_ALPHA="0.2"
 TAU_MODE="empirical"
@@ -71,12 +71,19 @@ PCL_KNOWN_UNLAB_W="1.0"
 NORM_D2_BY_C="True"
 PCL_WEIGHT="1.0"
 GRAD_CLIP="1.0"
-ESTIMATION_ONLY="True"
+ESTIMATION_ONLY="False"
+LDA_RIDGE_GAMMA="0.1"
+WEIGHT_DECAY="0.00005"
 DPMM_COV_SCALE="1.0"
+DPMM_COV_ITERS="3"
 DPMM_ALPHA="1.0"
+DPMM_BETA="1.0"
 DPMM_SEED="42"
 DPMM_SWEEPS="30"
 DPMM_PATIENCE="3"
+DPMM_MAX_POINTS="8000"
+DPMM_MIN_CLUSTER_SIZE="10"
+DPMM_MIN_POOL="10"
 DPMM_ABSORB="True"
 DPMM_MERGE="False"
 ABSORB_SCALE="0.1"
@@ -89,8 +96,10 @@ CE_WEIGHT="1.0"
 HEAD_LR="1e-2"
 LABELLED_WARMUP="0"
 CONF_TEMP="0.0"
+LOGIT_STD_STOP="9"
 P3_EPOCHS="15"
-P3_EXP="phase3_cifar10"
+P3_EXP="phase3_cifar10_test2"
+EXP_ROOT="/data/xGCD/exp"
 
 # ============================================================
 # Stage 1: CBL Pre-training
@@ -103,12 +112,13 @@ CBL_OUT="exp/${EXP_NAME}"
 if [ -f "$CBL_OUT/cbl_stage1.pt" ]; then
     echo "--- Stage 1 already done ($CBL_OUT/cbl_stage1.pt exists) — skipping ---"
 else
-    python -m methods.contrastive_training.stage1_cbl \
+    apptainer exec --nv "$CONTAINER"  python -m methods.contrastive_training.stage1_cbl \
         --dataset_name "$DATASET" \
+        --seed "$SEED" \
         --prop_train_labels 0.5 \
         --concept_conf_threshold "$CONF_THR" \
         --cbl_epochs "$STAGE1_EPOCHS" \
-        --cbl_lr 1e-4 \
+        --cbl_lr 1e-3 \
         --cbl_weight_decay 1e-5 \
         --cbl_batch_size 256 \
         --batch_size 128 \
@@ -130,42 +140,62 @@ ls -la "$CBL_OUT" 2>/dev/null || true
 # ============================================================
 # Phase 3: Parametric CE Refinement
 # ============================================================
-S3_OUT="exp/${P3_EXP}"
+S3_OUT="${EXP_ROOT}/${P3_EXP}"
 echo "=========================================="
 echo "Phase 3: CE refinement | peak_gate=$PEAK_GATE epochs=$P3_EPOCHS head_lr=$HEAD_LR warmup=$LABELLED_WARMUP"
 echo "=========================================="
-python -m methods.contrastive_training.phase3 \
+apptainer exec --nv "$CONTAINER"  python -m methods.contrastive_training.phase3 \
     --dataset_name "$DATASET" \
+    --seed "$SEED" \
+    --num_labeled_classes 5 \
     --cbl_dir "$CBL_OUT" \
     --prop_train_labels 0.5 \
     --concept_conf_threshold "$CONF_THR" \
+    --model_arch vit_base \
+    --grad_from_block 11 \
+    --cbl_hidden_layers 0 \
     --epochs "$P3_EPOCHS" \
+    --estimation_only "$ESTIMATION_ONLY" \
     --refresh_period "$REFRESH" \
+    --lr 0.1 \
     --cbl_lr "$CBL_LR" \
+    --cbl_lr_divisor "$CBL_LR_DIVISOR" \
+    --freeze_backbone "$FREEZE_BACKBONE" \
+    --weight_decay "$WEIGHT_DECAY" \
     --alpha_fidelity "$ALPHA_FIDELITY" \
     --grad_clip "$GRAD_CLIP" \
     --novelty_alpha "$NOVELTY_ALPHA" \
     --tau_mode "$TAU_MODE" \
+    --lda_ridge_gamma "$LDA_RIDGE_GAMMA" \
     --dpmm_cov_scale "$DPMM_COV_SCALE" \
+    --dpmm_cov_iters "$DPMM_COV_ITERS" \
     --dpmm_alpha "$DPMM_ALPHA" \
+    --dpmm_beta "$DPMM_BETA" \
+    --dpmm_sweeps "$DPMM_SWEEPS" \
+    --dpmm_max_points "$DPMM_MAX_POINTS" \
+    --dpmm_min_cluster_size "$DPMM_MIN_CLUSTER_SIZE" \
+    --dpmm_min_pool "$DPMM_MIN_POOL" \
+    --dpmm_patience "$DPMM_PATIENCE" \
     --dpmm_seed "$DPMM_SEED" \
     --dpmm_absorb "$DPMM_ABSORB" \
     --dpmm_merge "$DPMM_MERGE" \
     --absorb_scale "$ABSORB_SCALE" \
+    --merge_scale "$MERGE_SCALE" \
     --peak_gate "$PEAK_GATE" \
     --peak_thresh 0.80 \
     --ce_weight "$CE_WEIGHT" \
     --head_lr "$HEAD_LR" \
     --labelled_warmup "$LABELLED_WARMUP" \
     --conf_temp "$CONF_TEMP" \
+    --logit_std_stop "$LOGIT_STD_STOP" \
     --ref_acc 0.8707 \
     --batch_size 128 \
     --num_workers 4 \
+    --exp_root "$EXP_ROOT" \
     --exp_name "$P3_EXP" \
     --use_wandb True \
     --wandb_project "$WANDB_PROJECT" \
-    --wandb_entity "$WANDB_ENTITY"
-
+    --wandb_entity "$WANDB_ENTITY" 
 echo ""
 echo "=========================================="
 echo "xGCD PIPELINE COMPLETED — Stage1: $CBL_OUT | Phase3: $S3_OUT"
