@@ -7,7 +7,7 @@
 #SBATCH --mem=128gb
 #SBATCH --time=200:00:00
 #SBATCH --gres=gpu:a100:1
-#SBATCH --output=%j-2.log
+#SBATCH --output=%j-anchor.log
 
 echo "====================================================="
 pwd; hostname; date
@@ -43,7 +43,7 @@ apptainer exec --nv "$CONTAINER" python -c "import wandb; print('wandb', wandb._
 # Configuration
 # ============================================================
 DATASET="cifar10"
-EXP_NAME="stage1_cbl_cifar10_test2"
+EXP_NAME="stage1_cbl_cifar10_v2_test2"
 CONF_THR="0.15"
 SEED="42"
 
@@ -98,7 +98,7 @@ LABELLED_WARMUP="0"
 CONF_TEMP="0.0"
 LOGIT_STD_STOP="9"
 P3_EPOCHS="15"
-P3_EXP="phase3_cifar10_test2"
+P3_EXP="phase3_cifar10_anchor"
 EXP_ROOT="/data/xGCD/exp"
 
 # ============================================================
@@ -195,7 +195,9 @@ apptainer exec --nv "$CONTAINER"  python -m methods.contrastive_training.phase3 
     --exp_name "$P3_EXP" \
     --use_wandb True \
     --wandb_project "$WANDB_PROJECT" \
-    --wandb_entity "$WANDB_ENTITY" 
+    --wandb_entity "$WANDB_ENTITY" \
+    --anchor_loss True 
+
 echo ""
 echo "=========================================="
 echo "xGCD PIPELINE COMPLETED — Stage1: $CBL_OUT | Phase3: $S3_OUT"
