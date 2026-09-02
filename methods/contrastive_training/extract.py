@@ -24,7 +24,7 @@ def extract_backbone_features(backbone, loader, device) -> Tuple[torch.Tensor, t
     """Return (feats [N, 768], labels [N], uq_idxs [N]) on CPU."""
     backbone.eval()
     feats, labels, uqs = [], [], []
-    for batch in tqdm(loader, desc="extract features", leave=False):
+    for batch in loader:
         img, label, uq, _ = _unpack(batch)
         f = backbone(img.to(device))
         feats.append(f.detach().cpu())
@@ -42,7 +42,7 @@ def extract_concept_logits(model, loader, device):
     model.eval()
     logits, labels, uqs, masks = [], [], [], []
     have_mask = True
-    for batch in tqdm(loader, desc="extract logits", leave=False):
+    for batch in loader:
         img, label, uq, mask = _unpack(batch)
         ell = model(img.to(device))
         logits.append(ell.detach().cpu())
