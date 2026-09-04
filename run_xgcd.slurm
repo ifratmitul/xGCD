@@ -7,7 +7,7 @@
 #SBATCH --mem=128gb
 #SBATCH --time=200:00:00
 #SBATCH --gres=gpu:a100:1
-#SBATCH --output=%j.log
+#SBATCH --output=%j-2.log
 
 echo "====================================================="
 pwd; hostname; date
@@ -16,7 +16,11 @@ echo "====================================================="
 module load apptainer
 
 # --- project + container paths (EDIT to match the cluster) --------------------
+<<<<<<< HEAD
 PROJECT="/home/mozafarinia/Documents/xgcd-main"
+=======
+PROJECT="/home/mozafarinia/Documents/xGCD"
+>>>>>>> a18131318563eff11795284d6c7f24a13be98acf
 CONTAINER="/home/mozafarinia/Documents/xgcd.sif"
 cd "$PROJECT" || { echo "project dir not found: $PROJECT"; exit 1; }
 
@@ -43,8 +47,13 @@ apptainer exec --nv "$CONTAINER" python -c "import wandb; print('wandb', wandb._
 # Configuration
 # ============================================================
 DATASET="cifar10"
+<<<<<<< HEAD
 EXP_NAME="stage1_cbl_cifar10_v2"
+=======
+EXP_NAME="stage1_cbl_cifar10_test2"
+>>>>>>> a18131318563eff11795284d6c7f24a13be98acf
 CONF_THR="0.15"
+SEED="42"
 
 WANDB_PROJECT="xGCD"
 WANDB_ENTITY="ifrat-ikhtear-university-of-south-dakota"
@@ -97,7 +106,11 @@ LABELLED_WARMUP="0"
 CONF_TEMP="0.0"
 LOGIT_STD_STOP="9"
 P3_EPOCHS="15"
+<<<<<<< HEAD
 P3_EXP="phase3_cifar10_v2"
+=======
+P3_EXP="phase3_cifar10_test2"
+>>>>>>> a18131318563eff11795284d6c7f24a13be98acf
 EXP_ROOT="/data/xGCD/exp"
 
 # ============================================================
@@ -113,6 +126,7 @@ if [ -f "$CBL_OUT/cbl_stage1.pt" ]; then
 else
     apptainer exec --nv "$CONTAINER"  python -m methods.contrastive_training.stage1_cbl \
         --dataset_name "$DATASET" \
+        --seed "$SEED" \
         --prop_train_labels 0.5 \
         --concept_conf_threshold "$CONF_THR" \
         --cbl_epochs "$STAGE1_EPOCHS" \
@@ -144,6 +158,10 @@ echo "Phase 3: CE refinement | peak_gate=$PEAK_GATE epochs=$P3_EPOCHS head_lr=$H
 echo "=========================================="
 apptainer exec --nv "$CONTAINER"  python -m methods.contrastive_training.phase3 \
     --dataset_name "$DATASET" \
+<<<<<<< HEAD
+=======
+    --seed "$SEED" \
+>>>>>>> a18131318563eff11795284d6c7f24a13be98acf
     --num_labeled_classes 5 \
     --cbl_dir "$CBL_OUT" \
     --prop_train_labels 0.5 \
@@ -192,8 +210,7 @@ apptainer exec --nv "$CONTAINER"  python -m methods.contrastive_training.phase3 
     --exp_name "$P3_EXP" \
     --use_wandb True \
     --wandb_project "$WANDB_PROJECT" \
-    --wandb_entity "$WANDB_ENTITY"
-
+    --wandb_entity "$WANDB_ENTITY" 
 echo ""
 echo "=========================================="
 echo "xGCD PIPELINE COMPLETED — Stage1: $CBL_OUT | Phase3: $S3_OUT"
