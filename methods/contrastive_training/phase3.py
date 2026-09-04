@@ -77,6 +77,10 @@ def _eval(model, head, loader, prototypes, lda, k_lab, k_total, k_true, device, 
 
 
 def run_phase3(args):
+    logger.info("Args:")
+    for k, v in sorted(vars(args).items()):
+        logger.info(f"  {k}={v}")
+
     device = get_device()
     # reproducible CE refinement: without this the head/CBL training is unseeded and the
     # final All/Old/New vary run-to-run (K is already fixed by the seeded estimation).
