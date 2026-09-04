@@ -68,3 +68,4 @@ exp/
 
 *.slurm
 *.bash
+*.pth
