@@ -37,13 +37,14 @@ class DPMMResult:
 class DPMM:
     def __init__(self, alpha: float = 1.0, beta: float = 1.0, n_sweeps: int = 30,
                  max_points: Optional[int] = 8000, patience: int = 3,
-                 min_cluster_size: int = 10, seed: int = 42):
+                 min_cluster_size: int = 10, min_cluster_frac: float = 0.01, seed: int = 42):
         self.alpha = alpha
         self.beta = beta
         self.n_sweeps = n_sweeps
         self.max_points = max_points      # subsample the pool above this (speed)
         self.patience = patience          # stop if #clusters stable this many sweeps
-        self.min_cluster_size = min_cluster_size  # dissolve clusters below this (spurious)
+        self.min_cluster_size = min_cluster_size  # absolute floor: dissolve clusters below this
+        self.min_cluster_frac = min_cluster_frac  # fractional floor: dissolve clusters below frac*N
         self.seed = seed
 
     # ------------------------------------------------------------------ fit
@@ -145,8 +146,11 @@ class DPMM:
         z, counts_t, means = _finalize(z, X, counts, sums, self.beta, m0)
 
         # prune spurious sub-threshold clusters (dissolve, reassign to nearest surviving).
-        # fix #2: floor min size at 1% of the pool (kills micro-fragments 10 lets through).
-        min_size = max(self.min_cluster_size, int(0.01 * N))
+        # floor = max(absolute min_cluster_size, min_cluster_frac * N). The fractional floor
+        # kills micro-fragments, but a too-high fraction ERASES small real classes: on a 10k
+        # pool, 1% (=100) removes a novel class with <100 pooled samples before it can be
+        # counted. Lower min_cluster_frac (and/or min_cluster_size) when classes are small.
+        min_size = max(self.min_cluster_size, int(self.min_cluster_frac * N))
         if min_size > 1 and means.shape[0] > 1:
             k_before = means.shape[0]
             z, means, counts_t = _prune_small(
