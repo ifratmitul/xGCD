@@ -69,6 +69,5 @@ exp/
 *.pdf
 *.png
 !recognize-anything/images/*.png
-*.pth
 *.sif
 
