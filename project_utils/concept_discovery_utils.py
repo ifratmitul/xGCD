@@ -261,7 +261,7 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
     # vocabulary at this point, which is exactly what Grounding DINO needs supplied up front,
     # and it's the model already used everywhere else in this repo for labelled-set concept
     # targets (data/annotations/*.json, Stage 1's BCE targets)):
-    #   from methods.contrastive_training.grounding_dino_tagging import ground_by_uq, load_grounding_dino
+    #   from project_utils.grounding_dino_tagging_utils import ground_by_uq, load_grounding_dino
     #   gdino_model = load_grounding_dino(args.gdino_config, args.gdino_checkpoint, device)
     #   lab_tags_by_uq = ground_by_uq(gdino_model, lab_extract.data, lab_extract.uq_idxs, new_concepts,
     #                                 device, box_threshold=args.gdino_box_threshold,

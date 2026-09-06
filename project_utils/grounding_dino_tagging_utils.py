@@ -31,7 +31,7 @@ except ImportError as e:
         "recognize-anything/ is vendored) plus a config + checkpoint file."
     ) from e
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_GDINO_CONFIG = str(REPO_ROOT / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py")
 DEFAULT_GDINO_CHECKPOINT = str(REPO_ROOT / "GroundingDINO" / "weights" / "groundingdino_swint_ogc.pth")
 

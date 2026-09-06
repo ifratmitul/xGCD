@@ -15,8 +15,8 @@ set's vocabulary plays for data/annotations/ today.
 phase 3 — this script is for offline exploration/sanity-checking on a whole split.)
 
 Run:
-    python methods/contrastive_training/N-concept-Gen.py --dataset_name cifar10
-    python methods/contrastive_training/N-concept-Gen.py --dataset_name cifar10 --split test --limit 50
+    python project_utils/N-concept-Gen.py --dataset_name cifar10
+    python project_utils/N-concept-Gen.py --dataset_name cifar10 --split test --limit 50
 """
 import argparse
 import json
@@ -26,7 +26,7 @@ from pathlib import Path
 
 from loguru import logger
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))  # this file can't use `python -m` (hyphen in the name)
 
 from data.cifar import get_cifar_10_datasets, get_cifar_100_datasets  # noqa: E402
