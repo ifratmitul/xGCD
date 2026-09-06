@@ -1,0 +1,73 @@
+{
+  "0": [
+    "girl",
+    "stool",
+    "toy"
+  ],
+  "1": [
+    "drive",
+    "park",
+    "road",
+    "trailer",
+    "trailer truck",
+    "truck",
+    "white"
+  ],
+  "2": [
+    "car",
+    "crane",
+    "equipment",
+    "lift",
+    "load",
+    "tow truck",
+    "trailer truck"
+  ],
+  "3": [
+    "animal",
+    "chair",
+    "stool"
+  ],
+  "5": [
+    "car",
+    "decker bus",
+    "display",
+    "red",
+    "mall",
+    "sports car",
+    "toy car"
+  ],
+  "6": [
+    "animal",
+    "bird",
+    "blue",
+    "grass",
+    "greenery",
+    "lush",
+    "ostrich",
+    "park",
+    "peacock",
+    "sculpture",
+    "stand"
+  ],
+  "7": [
+    "brown",
+    "pony",
+    "field",
+    "horse",
+    "grass",
+    "green",
+    "lush",
+    "stand"
+  ],
+  "8": [
+    "blue",
+    "boat",
+    "calm",
+    "float",
+    "motorboat",
+    "sea",
+    "sky",
+    "vessel",
+    "water"
+  ]
+}
