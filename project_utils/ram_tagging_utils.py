@@ -21,10 +21,23 @@ from ram.models import ram_plus  # noqa: E402
 
 DEFAULT_RAM_PRETRAINED = str(REPO_ROOT / "recognize-anything" / "pretrained" / "ram_plus_swin_large_14m.pth")
 
+# RAM++'s text encoder loads its tokenizer via `BertTokenizer.from_pretrained(text_encoder_type)`,
+# which normally hits the Hugging Face Hub for "bert-base-uncased" -- unreachable from a
+# no-internet compute node. `from_pretrained` accepts a local folder just as well as a hub id,
+# so if vocab.txt/tokenizer_config.json/config.json have been manually downloaded into
+# DEFAULT_BERT_TOKENIZER_DIR, use that instead; otherwise fall back to the hub id (e.g. for a
+# dev machine that does have internet).
+DEFAULT_BERT_TOKENIZER_DIR = str(REPO_ROOT / "recognize-anything" / "pretrained" / "bert-base-uncased")
 
-def load_ram_plus(pretrained: str = DEFAULT_RAM_PRETRAINED, image_size: int = 384, device=None):
+
+def load_ram_plus(pretrained: str = DEFAULT_RAM_PRETRAINED, image_size: int = 384, device=None,
+                  text_encoder_type: str = None):
     device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-    model = ram_plus(pretrained=pretrained, image_size=image_size, vit="swin_l")
+    if text_encoder_type is None:
+        text_encoder_type = (DEFAULT_BERT_TOKENIZER_DIR if Path(DEFAULT_BERT_TOKENIZER_DIR).is_dir()
+                             else "bert-base-uncased")
+    model = ram_plus(pretrained=pretrained, image_size=image_size, vit="swin_l",
+                     text_encoder_type=text_encoder_type)
     model.eval().to(device)
     return model, get_ram_transform(image_size=image_size)
 
