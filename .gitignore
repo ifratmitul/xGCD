@@ -68,8 +68,6 @@ exp/
 *.bash
 *.pdf
 *.png
-
-
-*.slurm
-*.bash
 *.pth
+*.sif
+

@@ -17,7 +17,7 @@ module load apptainer
 
 # --- project + container paths (EDIT to match the cluster) --------------------
 PROJECT="/home/mozafarinia/Documents/xGCD"
-CONTAINER="/home/mozafarinia/Documents/xgcd.sif"
+CONTAINER="/home/mozafarinia/Documents/xGCD/xgcd.sif"
 cd "$PROJECT" || { echo "project dir not found: $PROJECT"; exit 1; }
 
 nvidia-smi
@@ -37,8 +37,8 @@ done
 # --- verify the environment INSIDE the container -----------------------------
 apptainer exec --nv "$CONTAINER" python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 apptainer exec --nv "$CONTAINER" python -c "import wandb; print('wandb', wandb.__version__)"
-
-
+# --- install packages INSIDE the container -----------------------------
+apptainer exec --nv "$CONTAINER" pip install --user --no-index --find-links="$HOME/wheels" transformers huggingface_hub tokenizers fairscale
 # ============================================================
 # Configuration
 # ============================================================
@@ -107,7 +107,7 @@ novel_min_images_per_cluster="1"  # minimum number of images per concept to keep
 cluster_images_n="20"  # number of images to visualize per cluster
 ram_pretrained="True"  # whether to use RAM pre-trained model for novel concept generation
 ram_batch_size="32"  # batch size for RAM inference
-cluster_images_dir="/cluster_images"  # directory to save cluster images
+cluster_images_dir="${PROJECT}/cluster_images"  # directory to save cluster images
 
 
 # ============================================================
@@ -153,7 +153,7 @@ S3_OUT="${EXP_ROOT}/${P3_EXP}"
 echo "=========================================="
 echo "Phase 3: CE refinement | peak_gate=$PEAK_GATE epochs=$P3_EPOCHS head_lr=$HEAD_LR warmup=$LABELLED_WARMUP"
 echo "=========================================="
-apptainer exec --nv "$CONTAINER"  python -m methods.contrastive_training.phase3 \
+apptainer exec --nv "$CONTAINER" python -m methods.contrastive_training.phase3 \
     --dataset_name "$DATASET" \
     --num_labeled_classes 5 \
     --cbl_dir "$CBL_OUT" \
