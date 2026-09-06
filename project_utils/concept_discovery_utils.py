@@ -22,28 +22,44 @@ phase3.py step 2) and before the classifier head is initialised (step 3):
      for them yet, so they start uncorrelated with everything else, unit variance.
   5. Extend `prototypes` with one new column per new concept, valued at the logit of that
      row's own empirical concept frequency (novel cluster: frequency among its RAM-tagged
-     members; known class: frequency among its labelled members, RAM-tagged the same way)
-     rather than a flat zero — informative rather than "neutral" where data exists for it.
+     members; known class: frequency among its labelled members, RAM-tagged the same way
+     for now — see point 6) rather than a flat zero — informative rather than "neutral"
+     where data exists for it.
   6. Extend the labelled-set BCE fidelity targets (`ConceptTargetLookup`) and `pos_weight`
-     for the new dims using RAM++ run once over the *labelled* set too. This is a deliberate
-     choice, not a shortcut: a known image CAN exhibit a concept discovered from a novel
-     cluster (e.g. "wheels", discovered from a novel "truck" cluster, is obviously also true
-     of a known "car"). Forcing that target to 0 would teach the CBL to suppress a concept it
-     can plainly see, fighting its own visual evidence on every known-class batch. RAM++
-     doesn't need Grounding DINO, so this recomputation costs one extra forward pass over the
-     (small) labelled set — not a live Grounding DINO integration.
+     for the new dims — NOT forced to 0. This is a deliberate choice, not a shortcut: a
+     known image CAN exhibit a concept discovered from a novel cluster (e.g. "wheels",
+     discovered from a novel "truck" cluster, is obviously also true of a known "car").
+     Forcing that target to 0 would teach the CBL to suppress a concept it can plainly see,
+     fighting its own visual evidence on every known-class batch. Currently done by running
+     RAM++ over the *labelled* set too (no candidate vocabulary needed, but also no
+     localization/grounding signal). The better-fit alternative -- Grounding DINO, since
+     `new_concepts` is by now a short, closed vocabulary, and it's the model already used
+     everywhere else in this repo for labelled-set concept targets, e.g.
+     data/annotations/*.json and Stage 1's BCE targets -- is written but commented out
+     in the code until groundingdino is installed/vendored here; switch back then.
+
+Also saves, per novel cluster, the `--cluster_images_n` member images nearest the cluster's
+own (pre-discovery) prototype plus its finalized concept set, to
+`--cluster_images_dir/<cluster_id>/` — a human-checkable "does this cluster + its concepts
+actually make sense" snapshot.
 
 Everything here runs ONCE, right after the class set is fixed — not every epoch. The returned
 `ExtendedConceptLookup` is a drop-in replacement for the plain `ConceptTargetLookup`: the
 training loop's `lookup.batch(uq)` call is unchanged either way.
 """
+import json
 from collections import Counter
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
 from loguru import logger
+from PIL import Image
 
-from methods.contrastive_training.ram_tagging import load_ram_plus, tag_by_uq
+# grounding_dino_tagging is imported lazily, inside discover_novel_concepts, so that importing
+# THIS module (e.g. from phase3.py at startup) doesn't require the groundingdino package to be
+# installed unless --novel_concepts is actually turned on.
+from project_utils.ram_tagging_utils import load_ram_plus, tag_by_uq
 from methods.gcd.eval_gcd import assign_to_prototypes
 from models.cbl import ConceptBottleneckLayer
 
@@ -115,6 +131,53 @@ def _tags_to_o(tags: List[str], concepts: List[str]) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- #
+# per-cluster snapshot: nearest-to-center images + finalized concept set
+# --------------------------------------------------------------------------- #
+def _save_cluster_snapshots(cluster_uqs: Dict[int, List[int]], candidate_by_cluster: Dict[int, set],
+                            cluster_tag_counts: Dict[int, Counter], vocab_set: set,
+                            novel_uq, novel_arrays, novel_logits: torch.Tensor,
+                            prototypes: torch.Tensor, lda, out_dir: str, n_images: int):
+    """For each novel cluster: save the `n_images` member images nearest the cluster's own
+    (pre-discovery) prototype under the fitted Mahalanobis metric, plus a concepts.json of
+    that cluster's finalized (post-threshold) concept set — to `out_dir/<cluster_id>/`.
+
+    Uses the ORIGINAL geometry (unlab_logits/prototypes/lda from before the CBL/LDA growth
+    below): the post-growth metric's new dims are an untrained identity-block placeholder,
+    not yet informative about which images are actually "central"."""
+    uq_to_pos = {int(u): i for i, u in enumerate(novel_uq.tolist())}
+    for cid, member_uq in cluster_uqs.items():
+        idx = [uq_to_pos[u] for u in member_uq]
+        z = lda.whiten(novel_logits[idx])
+        center = lda.whiten(prototypes[cid:cid + 1])
+        dist = torch.cdist(z, center).squeeze(1)
+        k = min(n_images, len(idx))
+        nearest = [idx[i] for i in dist.topk(k, largest=False).indices.tolist()]
+
+        cluster_dir = Path(out_dir) / str(cid)
+        cluster_dir.mkdir(parents=True, exist_ok=True)
+        for rank, pos in enumerate(nearest):
+            uq = int(novel_uq[pos])
+            img = Image.fromarray(novel_arrays[pos]).convert("RGB").resize((128, 128), Image.NEAREST)
+            img.save(cluster_dir / f"{rank:02d}_uq{uq}.png")
+
+        concepts = candidate_by_cluster.get(cid, set())
+        counts = cluster_tag_counts.get(cid, Counter())
+        payload = {
+            "cluster_id": cid,
+            "n_members": len(member_uq),
+            "n_images_saved": len(nearest),
+            "finalized_concepts": [
+                {"concept": c, "count_in_cluster": counts[c], "new_to_vocab": c not in vocab_set}
+                for c in sorted(concepts, key=lambda c: -counts[c])
+            ],
+        }
+        with open(cluster_dir / "concepts.json", "w") as f:
+            json.dump(payload, f, indent=2)
+        logger.info(f"[concept-discovery] cluster {cid}: saved {len(nearest)} nearest-to-center "
+                   f"images + {len(concepts)} finalized concepts -> {cluster_dir}")
+
+
+# --------------------------------------------------------------------------- #
 # main entry point
 # --------------------------------------------------------------------------- #
 def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: torch.Tensor,
@@ -170,6 +233,15 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
         top = counts.most_common(8)
         logger.info(f"  cluster {cid} (n={len(cluster_uqs[cid])}): " +
                    ", ".join(f"{t}({n})" for t, n in top))
+
+    # ---- snapshot: nearest-to-center images + finalized concepts, per novel cluster ----
+    # Uses the PRE-growth geometry (unlab_logits/prototypes/lda as passed in) -- see
+    # _save_cluster_snapshots's docstring for why.
+    novel_logits = unlab_logits[torch.from_numpy(novel_mask)]
+    _save_cluster_snapshots(cluster_uqs, candidate_by_cluster, cluster_tag_counts, vocab_set,
+                            novel_uq, novel_arrays, novel_logits, prototypes, lda,
+                            args.cluster_images_dir, args.cluster_images_n)
+
     if delta_c == 0:
         logger.info("[concept-discovery] nothing new to add; CBL/vocab unchanged")
         return vocab, model, lookup, pos_weight, prototypes, lda
@@ -182,7 +254,21 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
     # ---- 4. extend the LDA metric ----
     _extend_lda_block_diag(lda, delta_c, device)
 
-    # ---- 5/6. RAM-tag the LABELLED set too (recompute, not force-zero — see module docstring) ----
+    # ---- 5/6. get the LABELLED set's targets for the new concept dims (recompute, not
+    #           force-zero — see module docstring point 6) ----
+    # Grounding DINO version (not used for now — groundingdino isn't installed/vendored here
+    # yet; switch back once it's set up on the GPU machine. `new_concepts` is a short, closed
+    # vocabulary at this point, which is exactly what Grounding DINO needs supplied up front,
+    # and it's the model already used everywhere else in this repo for labelled-set concept
+    # targets (data/annotations/*.json, Stage 1's BCE targets)):
+    #   from methods.contrastive_training.grounding_dino_tagging import ground_by_uq, load_grounding_dino
+    #   gdino_model = load_grounding_dino(args.gdino_config, args.gdino_checkpoint, device)
+    #   lab_tags_by_uq = ground_by_uq(gdino_model, lab_extract.data, lab_extract.uq_idxs, new_concepts,
+    #                                 device, box_threshold=args.gdino_box_threshold,
+    #                                 text_threshold=args.gdino_text_threshold)
+    #
+    # RAM++ version (used for now): no candidate vocabulary needed either, but also no
+    # localization/grounding signal -- good enough to get the pipeline running end to end.
     lab_tags_by_uq = tag_by_uq(ram_model, ram_transform, lab_extract.data, lab_extract.uq_idxs,
                               device, batch_size=args.ram_batch_size)
     lab_o_by_uq = {int(u): _tags_to_o(tags, new_concepts) for u, tags in lab_tags_by_uq.items()}

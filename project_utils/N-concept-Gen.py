@@ -11,6 +11,9 @@ unlabelled/novel-class split and saves, per image, the concept bag it sees. The 
 bags is the candidate vocabulary to hand to Grounding DINO next, the same role the labelled
 set's vocabulary plays for data/annotations/ today.
 
+(concept_discovery.py runs the same RAM++ tagging, scoped per DPMM cluster, live inside
+phase 3 — this script is for offline exploration/sanity-checking on a whole split.)
+
 Run:
     python methods/contrastive_training/N-concept-Gen.py --dataset_name cifar10
     python methods/contrastive_training/N-concept-Gen.py --dataset_name cifar10 --split test --limit 50
@@ -21,44 +24,15 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-import torch
 from loguru import logger
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))  # this file can't use `python -m` (hyphen in the name)
-sys.path.insert(0, str(REPO_ROOT / "recognize-anything"))
-
-from ram import get_transform as get_ram_transform  # noqa: E402
-from ram.models import ram_plus  # noqa: E402
 
 from data.cifar import get_cifar_10_datasets, get_cifar_100_datasets  # noqa: E402
 from data.splits import configure_splits  # noqa: E402
-
-
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-class RawImageDataset(Dataset):
-    """Raw uint8 CIFAR arrays through RAM++'s own transform — deliberately bypasses the
-    DINO-oriented `dataset.transform` used elsewhere in xGCD, since RAM++ has its own
-    resize/normalize convention."""
-
-    def __init__(self, cifar_dataset, transform):
-        self.data = cifar_dataset.data
-        self.uq_idxs = cifar_dataset.uq_idxs
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, i):
-        image = self.transform(Image.fromarray(self.data[i]).convert("RGB"))
-        return image, int(self.uq_idxs[i])
+from project_utils.ram_tagging_utils import (  # noqa: E402
+    DEFAULT_RAM_PRETRAINED, load_ram_plus, tag_by_uq)
 
 
 def _get_datasets(args):
@@ -74,9 +48,6 @@ def _get_datasets(args):
 
 
 def generate_concept_bags(args):
-    device = get_device()
-    logger.info(f"N-concept-Gen device: {device}")
-
     configure_splits(args)
     datasets = _get_datasets(args)
     cifar_dataset = datasets.get(args.split)
@@ -86,28 +57,14 @@ def generate_concept_bags(args):
     logger.info(f"{args.dataset_name}/{args.split}: {len(cifar_dataset)} images "
                f"(no class labels used from here on)")
 
-    transform = get_ram_transform(image_size=args.ram_image_size)
-    raw_ds = RawImageDataset(cifar_dataset, transform)
+    data, uq_idxs = cifar_dataset.data, cifar_dataset.uq_idxs
     if args.limit:
-        raw_ds.data = raw_ds.data[:args.limit]
-        raw_ds.uq_idxs = raw_ds.uq_idxs[:args.limit]
-    loader = DataLoader(raw_ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers)
+        data, uq_idxs = data[:args.limit], uq_idxs[:args.limit]
 
-    model = ram_plus(pretrained=args.pretrained, image_size=args.ram_image_size, vit="swin_l")
-    model.eval().to(device)
-
-    tags_by_uq = {}
-    tag_counts = Counter()
-    with torch.no_grad():
-        for images, uq_idxs in loader:
-            images = images.to(device)
-            tag_strs, _ = model.generate_tag(images)
-            for uq, tag_str in zip(uq_idxs.tolist(), tag_strs):
-                tags = [t.strip() for t in tag_str.split("|") if t.strip()]
-                tags_by_uq[str(uq)] = tags
-                tag_counts.update(tags)
-            logger.info(f"  tagged {len(tags_by_uq)}/{len(raw_ds)}")
+    model, transform = load_ram_plus(args.pretrained, args.ram_image_size)
+    tags_by_uq = tag_by_uq(model, transform, data, uq_idxs, next(model.parameters()).device,
+                           batch_size=args.batch_size, num_workers=args.num_workers)
+    tag_counts = Counter(t for tags in tags_by_uq.values() for t in tags)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +72,7 @@ def generate_concept_bags(args):
     vocab_path = out_dir / f"{args.dataset_name}_{args.split}_ram_vocab.json"
 
     with open(tags_path, "w") as f:
-        json.dump(tags_by_uq, f, indent=2)
+        json.dump({str(uq): tags for uq, tags in tags_by_uq.items()}, f, indent=2)
 
     vocab = sorted(t for t, n in tag_counts.items() if n >= args.min_images)
     with open(vocab_path, "w") as f:
@@ -140,8 +97,7 @@ def get_parser():
     p.add_argument("--split", type=str, default="train_unlabelled",
                    choices=["train_labelled", "train_unlabelled", "test"],
                    help="train_unlabelled = the known+novel pool with no usable class label")
-    p.add_argument("--pretrained", type=str,
-                   default=str(REPO_ROOT / "recognize-anything" / "pretrained" / "ram_plus_swin_large_14m.pth"))
+    p.add_argument("--pretrained", type=str, default=DEFAULT_RAM_PRETRAINED)
     p.add_argument("--ram_image_size", type=int, default=384)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=4)

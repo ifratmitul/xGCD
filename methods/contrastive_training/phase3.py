@@ -36,6 +36,8 @@ from models.classifier_head import ClassifierHead
 from models.model_factory import build_concept_model
 from project_utils.cluster_and_log_utils import split_cluster_acc_v2
 from project_utils.general_utils import str2bool
+from project_utils.ram_tagging_utils import DEFAULT_RAM_PRETRAINED
+from project_utils.concept_discovery_utils import ConceptDriftTracker, discover_novel_concepts
 
 
 @torch.no_grad()
@@ -136,6 +138,17 @@ def run_phase3(args):
     prototypes = _peak_gate(res.prototypes.to(device), k_known, args.peak_thresh, args.peak_gate)
     k_total = prototypes.shape[0]
 
+    # ---- 2.b. novel-concept discovery (RAM++, no class label / vocabulary needed) ----
+    # Grows vocab/CBL/prototypes/lda/lookup/pos_weight in place if args.novel_concepts;
+    # a no-op passthrough otherwise (or if no novel cluster survived the peak-gate).
+    num_old_concepts = args.num_concepts
+    if args.novel_concepts:
+        vocab, model, lookup, pos_weight, prototypes, lda = discover_novel_concepts(
+            args, model, vocab, lookup, pos_weight, prototypes, lda, k_known,
+            unlab_logits, unlab_extract, lab_extract, device)
+        args.num_concepts = len(vocab)
+    drift = ConceptDriftTracker(k_known, k_total, num_old_concepts, vocab, prototypes)
+
     # ---- 3. head, initialised from the (gated) prototypes ----
     head = ClassifierHead(args.num_concepts, k_total).to(device)
     head.init_from_prototypes(prototypes, lda.precision)
@@ -166,6 +179,7 @@ def run_phase3(args):
                  args.num_unlabeled_classes, device, "epoch0", 0)
     logger.info(f"[phase3] chain: {args.ref_acc:.4f} (frozen-proto ref) -> "
                 f"epoch-0 head {base['all']:.4f} (gated init, no training) -> trained head below")
+    drift.log(model, lab_loader, unlab_loader, prototypes, lda, device, "epoch0")
 
     # ---- 5. optimiser: two LR groups (head fresh -> higher LR; CBL sensitive -> low) ----
     optimizer = torch.optim.SGD(
@@ -218,6 +232,8 @@ def run_phase3(args):
         do_refresh = (epoch + 1) % args.refresh_period == 0 or (epoch + 1) == args.epochs
         if do_refresh and not labelled_only:
             refresh_pseudo()
+        if do_refresh:
+            drift.log(model, lab_loader, unlab_loader, prototypes, lda, device, f"epoch{epoch+1}")
         m = _eval(model, head, unlab_loader, prototypes, lda, k_known, k_total,
                   args.num_unlabeled_classes, device, "eval", epoch + 1)
         logger.info(f"[phase3] epoch {epoch+1}/{args.epochs} loss={agg['loss']:.4f} "
@@ -272,6 +288,26 @@ def get_phase3_parser():
                    help="frozen-pipeline reference All-ACC to beat (for the comparison chain)")
     p.add_argument("--seed", type=int, default=42,
                    help="seed for reproducible CE refinement (shuffle + init + cudnn deterministic)")
+    # novel-concept discovery (RAM++; see concept_discovery.py)
+    p.add_argument("--novel_concepts", type=str2bool, default=False,
+                   help="RAM++-discover concepts for novel DPMM clusters and grow the CBL for them")
+    p.add_argument("--novel_min_images_per_cluster", type=int, default=2,
+                   help="a RAM tag must appear in >= this many of a cluster's own images to be a candidate")
+    p.add_argument("--ram_pretrained", type=str, default=DEFAULT_RAM_PRETRAINED)
+    p.add_argument("--ram_image_size", type=int, default=384)
+    p.add_argument("--ram_batch_size", type=int, default=32)
+    p.add_argument("--cluster_images_dir", type=str, default="cluster_images",
+                   help="per novel cluster: nearest-to-center images + finalized concepts -> <this>/<cluster_id>/")
+    p.add_argument("--cluster_images_n", type=int, default=20,
+                   help="how many nearest-to-center member images to save per novel cluster")
+    # Grounding DINO (labelled-set targets for newly discovered concepts; not installed by
+    # default here -- see grounding_dino_tagging.py's docstring)
+    p.add_argument("--gdino_config", type=str,
+                   default="GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py")
+    p.add_argument("--gdino_checkpoint", type=str,
+                   default="GroundingDINO/weights/groundingdino_swint_ogc.pth")
+    p.add_argument("--gdino_box_threshold", type=float, default=0.35)
+    p.add_argument("--gdino_text_threshold", type=float, default=0.25)
     return p
 
 
