@@ -64,6 +64,10 @@ coverage/
 
 # xGCD experiment outputs
 exp/
+*.slurm
+*.bash
+*.pdf
+*.png
 
 
 *.slurm
