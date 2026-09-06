@@ -14,3 +14,23 @@ loguru==0.7.2
 yacs==0.1.8
 randaugment==1.0.2
 kmeans-pytorch==0.3
+
+# RAM++ (recognize-anything) deps -- recognize-anything/ itself is vendored as plain
+# source in the project checkout (not pip-installed; ram_tagging_utils.py sys.path-inserts
+# it), so only ITS dependencies are listed here. Pinned to the exact combo validated
+# locally: unpinned `transformers` pulls a 5.x release needing torch>=2.4, which breaks
+# torch 2.2.2 with `AttributeError: module 'torch' has no attribute 'compiler'`;
+# huggingface_hub/tokenizers are pinned to match this transformers release.
+transformers==4.30.2
+huggingface_hub==0.16.4
+tokenizers==0.13.3
+fairscale==0.4.13
+
+# Grounding DINO deps -- pure-Python only; the repo itself (which builds an optional CUDA
+# extension) is installed separately in xgcd.def's %post, with a build-failure fallback.
+addict==2.4.0
+yapf==0.40.2
+opencv-python-headless==4.10.0.84
+supervision==0.24.0
+pycocotools==2.0.8
+ninja==1.11.1.1
