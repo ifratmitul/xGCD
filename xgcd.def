@@ -1,0 +1,88 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+
+# ---------------------------------------------------------------------------
+# xGCD training container (Stage-1 CBL + Stage-2 xGCD).
+#
+# Build (pick one):
+#   singularity build --fakeroot xgcd.simg xgcd.def      # rootless, on the cluster
+#   sudo singularity build xgcd.simg xgcd.def            # if you have root
+#   apptainer  build --fakeroot xgcd.simg xgcd.def       # Apptainer equivalent
+#
+# Run (‑‑nv exposes the host GPUs):
+#   singularity exec --nv xgcd.simg python -m methods.contrastive_training.xgcd --help
+#   singularity exec --nv --bind /data:/data xgcd.simg python -m methods.contrastive_training.xgcd ...
+#
+# NOTE: match the CUDA tag (cuda12.1) to your cluster's driver. If nvidia-smi on
+# the node shows an older driver, switch the From: line to a *-cuda11.8-* image.
+# ---------------------------------------------------------------------------
+
+%files
+    requirements.txt /opt/requirements.txt
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        git wget ca-certificates build-essential \
+        libgl1 libglib2.0-0 \
+        && rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --no-cache-dir --upgrade pip
+
+    # project dependencies (torch/torchvision already provided by the base image)
+    python -m pip install --no-cache-dir -r /opt/requirements.txt
+
+    # imported by the code but absent from requirements.txt
+    python -m pip install --no-cache-dir wandb
+
+    # --- RAM++ (recognize-anything) deps -----------------------------------
+    # recognize-anything/ itself is vendored as plain source in the project checkout
+    # (not pip-installed -- ram_tagging_utils.py sys.path-inserts it), so only ITS
+    # dependencies need installing here. Pinned to the exact combo validated locally:
+    # unpinned `transformers` pulls a 5.x release that needs torch>=2.4 and breaks
+    # this image's torch 2.2.2 with `AttributeError: module 'torch' has no attribute
+    # 'compiler'`; huggingface_hub/tokenizers are pinned to match this transformers.
+    python -m pip install --no-cache-dir \
+        "transformers==4.30.2" "huggingface_hub==0.16.4" "tokenizers==0.13.3" "fairscale==0.4.13"
+
+    # --- Grounding DINO deps -------------------------------------------------
+    # Its pure-Python deps, then the repo itself (setup.py builds an optional CUDA
+    # extension for multi-scale deformable attention). NOTE: this base image is
+    # "-runtime", which has no nvcc -- if the extension fails to build, Grounding
+    # DINO still runs via its pure-PyTorch attention fallback (just slower); for a
+    # working compiled extension, rebuild from a "-devel" tagged base image instead.
+    python -m pip install --no-cache-dir addict yapf opencv-python-headless supervision pycocotools ninja
+    git clone --depth 1 https://github.com/IDEA-Research/GroundingDINO.git /opt/GroundingDINO
+    python -m pip install --no-cache-dir -e /opt/GroundingDINO || \
+        echo "WARNING: GroundingDINO CUDA extension build failed -- pure-PyTorch fallback will be used at runtime"
+
+    python -m pip check || true
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+%runscript
+    # default entrypoint: `singularity run xgcd.simg <args>` -> python <args>
+    exec python "$@"
+
+%test
+    python -c "import torch, timm, sklearn, scipy, pandas, loguru, wandb, kmeans_pytorch; \
+print('torch', torch.__version__, 'cuda build', torch.version.cuda)"
+    python -c "import transformers, fairscale, huggingface_hub, tokenizers; \
+print('transformers', transformers.__version__, 'fairscale', fairscale.__version__)"
+    python -c "import groundingdino; print('groundingdino import OK (CUDA ext optional)')"
+
+%labels
+    Application xGCD
+    Description Stage-1 CBL + Stage-2 xGCD training environment
+    PyTorch 2.2.2-cuda12.1-cudnn8
+
+%help
+    Singularity image for the xGCD project. GPU access requires the --nv flag.
+    Bind your dataset / experiment dirs with --bind. Example:
+      singularity exec --nv --bind /scratch/data:/data xgcd.simg \
+        python -m methods.contrastive_training.xgcd --dataset_name cifar10 \
+        --cbl_dir exp/stage1_cbl_cifar10 --freeze_backbone True --phase1_lambda 0.1
