@@ -6,7 +6,7 @@
 #SBATCH --partition=gpu
 #SBATCH --mem=128gb
 #SBATCH --time=200:00:00
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:l40:1  #a100
 #SBATCH --output=%j-concept_generation.log
 
 echo "====================================================="
@@ -105,7 +105,6 @@ EXP_ROOT="/data/xGCD/exp"
 novel_concepts="True"  # whether to generate novel concepts after phase 3
 novel_min_images_per_cluster="1"  # minimum number of images per concept to keep it
 cluster_images_n="20"  # number of images to visualize per cluster
-ram_pretrained="True"  # whether to use RAM pre-trained model for novel concept generation
 ram_batch_size="32"  # batch size for RAM inference
 cluster_images_dir="${PROJECT}/cluster_images"  # directory to save cluster images
 
@@ -207,7 +206,6 @@ apptainer exec --nv "$CONTAINER" python -m methods.contrastive_training.phase3 \
     --novel_concepts "$novel_concepts" \
     --novel_min_images_per_cluster "$novel_min_images_per_cluster" \
     --cluster_images_n "$cluster_images_n" \
-    --ram_pretrained "$ram_pretrained" \
     --ram_batch_size "$ram_batch_size" \
     --cluster_images_dir "$cluster_images_dir"
 
