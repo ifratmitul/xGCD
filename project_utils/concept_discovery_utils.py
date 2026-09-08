@@ -237,7 +237,7 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
     # ---- snapshot: nearest-to-center images + finalized concepts, per novel cluster ----
     # Uses the PRE-growth geometry (unlab_logits/prototypes/lda as passed in) -- see
     # _save_cluster_snapshots's docstring for why.
-    novel_logits = unlab_logits[torch.from_numpy(novel_mask)]
+    novel_logits = unlab_logits[torch.from_numpy(novel_mask)].to(device)
     _save_cluster_snapshots(cluster_uqs, candidate_by_cluster, cluster_tag_counts, vocab_set,
                             novel_uq, novel_arrays, novel_logits, prototypes, lda,
                             args.cluster_images_dir, args.cluster_images_n)
