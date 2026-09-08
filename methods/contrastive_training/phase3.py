@@ -171,6 +171,20 @@ def run_phase3(args):
     conf_temp = args.conf_temp if args.conf_temp > 0 else float(args.num_concepts)
     logger.info(f"[phase3] head init from {k_total} prototypes | conf_temp={conf_temp:.1f}")
 
+    # ---- 3.b known-class rows use OLD concepts only (structural, not just trained-toward) ----
+    # logit = W . ell + b; zeroing W's new-dim columns for known rows means a known class's
+    # score literally cannot depend on the new concepts' values, whatever CE does elsewhere.
+    # Novel rows are untouched -- they're supposed to use the full concept set. Re-applied
+    # after every optimizer step below so training can't drift these back away from zero.
+    known_rows_old_dims_only = args.novel_concepts and args.num_concepts > num_old_concepts and args.novel_known_rows_old_dims_only
+    if known_rows_old_dims_only:
+        with torch.no_grad():
+            head.fc.weight[:k_known, num_old_concepts:].zero_()
+            head.fc.bias[:k_known] = -0.5 * (head.fc.weight[:k_known] * prototypes[:k_known]).sum(dim=1)
+        logger.info(f"[phase3] known-class head rows restricted to the original {num_old_concepts} "
+                   f"concepts (new-dim weights zeroed, bias recomputed to match) -- known "
+                   f"classification structurally unaffected by the new concepts")
+
     # ---- 4. pseudo-labels by uq: GT for labelled, head-argmax for unlabelled ----
     max_uq = int(max(int(lab_uq.max()), int(unlab_uq.max()))) + 1
     pseudo = torch.full((max_uq,), -1, dtype=torch.long, device=device)
@@ -246,6 +260,9 @@ def run_phase3(args):
                 torch.nn.utils.clip_grad_norm_(
                     list(head.parameters()) + list(model.cbl.parameters()), args.grad_clip)
             optimizer.step()
+            if known_rows_old_dims_only:
+                with torch.no_grad():
+                    head.fc.weight[:k_known, num_old_concepts:].zero_()
             agg["ce"] += float(L_ce); agg["bce"] += float(L_bce); agg["loss"] += float(loss); nb += 1
         for k in agg:
             agg[k] /= max(nb, 1)
@@ -331,6 +348,10 @@ def get_phase3_parser():
     p.add_argument("--novel_bce_include_unlabelled", type=str2bool, default=False,
                    help="in the main training loop, also supervise the new concept dims on "
                         "unlabelled/novel images (RAM-derived targets), not just labelled ones")
+    p.add_argument("--novel_known_rows_old_dims_only", type=str2bool, default=False,
+                   help="zero the head's new-concept weights for KNOWN class rows (kept at zero "
+                        "throughout training) so known classification structurally can't depend "
+                        "on the new concepts, even though the CBL still learns them from all images")
     # Grounding DINO (labelled-set targets for newly discovered concepts; not installed by
     # default here -- see grounding_dino_tagging.py's docstring)
     p.add_argument("--gdino_config", type=str,
