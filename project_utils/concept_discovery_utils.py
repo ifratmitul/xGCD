@@ -233,6 +233,14 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
         top = counts.most_common(8)
         logger.info(f"  cluster {cid} (n={len(cluster_uqs[cid])}): " +
                    ", ".join(f"{t}({n})" for t, n in top))
+    # candidate NAME per cluster (its single most-frequent RAM tag) -- diagnostic only, to
+    # eyeball how close RAM's own top guess is to the cluster's true identity, independent
+    # of whatever concept-expansion strategy (if any) runs next.
+    for cid, counts in cluster_tag_counts.items():
+        if counts:
+            name, n = counts.most_common(1)[0]
+            logger.info(f"[concept-discovery] cluster {cid} candidate NAME (top RAM tag): "
+                       f"'{name}' ({n}/{len(cluster_uqs[cid])} images = {100*n/len(cluster_uqs[cid]):.0f}%)")
 
     # ---- snapshot: nearest-to-center images + finalized concepts, per novel cluster ----
     # Uses the PRE-growth geometry (unlab_logits/prototypes/lda as passed in) -- see
