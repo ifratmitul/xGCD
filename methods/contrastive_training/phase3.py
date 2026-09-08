@@ -176,7 +176,7 @@ def run_phase3(args):
     # score literally cannot depend on the new concepts' values, whatever CE does elsewhere.
     # Novel rows are untouched -- they're supposed to use the full concept set. Re-applied
     # after every optimizer step below so training can't drift these back away from zero.
-    known_rows_old_dims_only = args.novel_concepts and args.num_concepts > num_old_concepts and args.novel_known_rows_old_dims_only
+    known_rows_old_dims_only = args.novel_concepts and args.num_concepts > num_old_concepts and args.novel_known_classes_use_old_concepts_only
     if known_rows_old_dims_only:
         with torch.no_grad():
             head.fc.weight[:k_known, num_old_concepts:].zero_()
@@ -353,7 +353,7 @@ def get_phase3_parser():
     p.add_argument("--novel_bce_include_unlabelled", type=str2bool, default=False,
                    help="in the main training loop, also supervise the new concept dims on "
                         "unlabelled/novel images (RAM-derived targets), not just labelled ones")
-    p.add_argument("--novel_known_rows_old_dims_only", type=str2bool, default=False,
+    p.add_argument("--novel_known_classes_use_old_concepts_only", type=str2bool, default=False,
                    help="zero the head's new-concept weights for KNOWN class rows (kept at zero "
                         "throughout training) so known classification structurally can't depend "
                         "on the new concepts, even though the CBL still learns them from all images")
