@@ -242,6 +242,40 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
         top = counts.most_common(8)
         logger.info(f"  cluster {cid} (n={len(cluster_uqs[cid])}): " +
                    ", ".join(f"{t}({n})" for t, n in top))
+
+    # ---- 2.b drop candidates that are near-universal within some EXISTING known class ----
+    # min_images_per_cluster only checks "common within the discovering cluster" -- says
+    # nothing about whether the same concept is already near-universal for some known class
+    # (e.g. "blue" showing up in most of some known class's own images), which makes it a
+    # poor discriminator regardless of how cluster-prevalent it is. Off by default
+    # (--novel_drop_known_universal_thresh 0 disables it); tags the labelled set here
+    # (moved up from step 5/6 below, which now reuses this instead of re-tagging).
+    lab_tags_by_uq, lab_o_by_uq = {}, {}
+    if delta_c > 0:
+        lab_tags_by_uq = tag_by_uq(ram_model, ram_transform, lab_extract.data, lab_extract.uq_idxs,
+                                  device, batch_size=args.ram_batch_size)
+        lab_o_by_uq = {int(u): _tags_to_o(tags, new_concepts) for u, tags in lab_tags_by_uq.items()}
+    if delta_c > 0 and args.novel_drop_known_universal_thresh > 0:
+        lab_targets = lab_extract.targets
+        lab_uqs_list = lab_extract.uq_idxs.tolist()
+        known_class_freq: Dict[str, float] = {}
+        for k in range(k_known):
+            member_uq = [int(u) for u, lbl in zip(lab_uqs_list, lab_targets) if lbl == k]
+            if not member_uq:
+                continue
+            freqs = torch.stack([lab_o_by_uq[u] for u in member_uq]).mean(0)
+            for ci, c in enumerate(new_concepts):
+                known_class_freq[c] = max(known_class_freq.get(c, 0.0), float(freqs[ci]))
+        thresh = args.novel_drop_known_universal_thresh
+        universal = [c for c in new_concepts if known_class_freq.get(c, 0.0) >= thresh]
+        if universal:
+            logger.info(f"[concept-discovery] dropping {len(universal)} concepts near-universal "
+                       f"in >=1 known class (thresh={thresh}): " +
+                       ", ".join(f"{c}({known_class_freq[c]:.2f})" for c in universal))
+            new_concepts = [c for c in new_concepts if c not in universal]
+            delta_c = len(new_concepts)
+            candidate_by_cluster = {cid: cands - set(universal) for cid, cands in candidate_by_cluster.items()}
+            lab_o_by_uq = {u: _tags_to_o(lab_tags_by_uq[u], new_concepts) for u in lab_o_by_uq}
     # candidate NAME per cluster (its single most-frequent RAM tag) -- diagnostic only, to
     # eyeball how close RAM's own top guess is to the cluster's true identity, independent
     # of whatever concept-expansion strategy (if any) runs next.
@@ -286,9 +320,8 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
     #
     # RAM++ version (used for now): no candidate vocabulary needed either, but also no
     # localization/grounding signal -- good enough to get the pipeline running end to end.
-    lab_tags_by_uq = tag_by_uq(ram_model, ram_transform, lab_extract.data, lab_extract.uq_idxs,
-                              device, batch_size=args.ram_batch_size)
-    lab_o_by_uq = {int(u): _tags_to_o(tags, new_concepts) for u, tags in lab_tags_by_uq.items()}
+    # (lab_tags_by_uq / lab_o_by_uq were already computed in step 2.b above, against the
+    # final post-filter `new_concepts` -- reused here rather than re-tagging.)
 
     # per-image targets for the NOVEL images too (new dims only -- no Grounding-DINO ground
     # truth exists for unlabelled images at all, so only the RAM-discovered new concepts can

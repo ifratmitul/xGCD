@@ -332,6 +332,11 @@ def get_phase3_parser():
                    help="RAM++-discover concepts for novel DPMM clusters and grow the CBL for them")
     p.add_argument("--novel_min_images_per_cluster", type=int, default=2,
                    help="a RAM tag must appear in >= this many of a cluster's own images to be a candidate")
+    p.add_argument("--novel_drop_known_universal_thresh", type=float, default=0.0,
+                   help="drop a candidate concept if it appears in >= this fraction of some "
+                        "EXISTING known class's own labelled images (0 = disabled). A concept "
+                        "near-universal for a known class is a poor discriminator regardless of "
+                        "how common it is within the discovering novel cluster")
     p.add_argument("--ram_pretrained", type=str, default=DEFAULT_RAM_PRETRAINED)
     p.add_argument("--ram_image_size", type=int, default=384)
     p.add_argument("--ram_batch_size", type=int, default=32)
