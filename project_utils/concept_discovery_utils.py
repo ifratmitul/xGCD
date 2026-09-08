@@ -53,8 +53,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from loguru import logger
 from PIL import Image
+from torch.utils.data import DataLoader
 
 # grounding_dino_tagging is imported lazily, inside discover_novel_concepts, so that importing
 # THIS module (e.g. from phase3.py at startup) doesn't require the groundingdino package to be
@@ -183,12 +185,19 @@ def _save_cluster_snapshots(cluster_uqs: Dict[int, List[int]], candidate_by_clus
 def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: torch.Tensor,
                             prototypes: torch.Tensor, lda, k_known: int,
                             unlab_logits: torch.Tensor, unlab_extract, lab_extract, device
-                            ) -> Tuple[List[str], object, object, torch.Tensor, torch.Tensor, object]:
-    """Returns (vocab, model, lookup, pos_weight, prototypes, lda), all possibly grown."""
+                            ) -> Tuple[List[str], object, object, torch.Tensor, torch.Tensor, object,
+                                      Dict[int, torch.Tensor], Dict[int, List[int]]]:
+    """Returns (vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs),
+    all possibly grown. `novel_o_by_uq` ({uq: [delta_c] 0/1}) and `cluster_uqs`
+    ({cluster_id: [uq...]}) are the per-image RAM targets and cluster membership for the
+    *novel* images -- reused by warmup_cbl_and_refit_prototypes and the main training loop's
+    combined_fidelity_bce so novel images finally get direct supervision on the concepts
+    that were discovered from them, instead of only ever influencing the CBL indirectly
+    through the CE/pseudo-label loss."""
     k_total = prototypes.shape[0]
     if k_total <= k_known:
         logger.info("[concept-discovery] no novel clusters survived the peak-gate; skipping")
-        return vocab, model, lookup, pos_weight, prototypes, lda
+        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}
 
     assignments = assign_to_prototypes(unlab_logits, prototypes, lda).cpu().numpy()
     novel_mask = assignments >= k_known
@@ -197,7 +206,7 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
                f"fell in a novel cluster (k_known={k_known}, k_total={k_total})")
     if n_novel_imgs == 0:
         logger.info("[concept-discovery] no unlabelled images landed in a novel cluster; skipping")
-        return vocab, model, lookup, pos_weight, prototypes, lda
+        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}
 
     ram_model, ram_transform = load_ram_plus(args.ram_pretrained, args.ram_image_size, device)
 
@@ -252,7 +261,7 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
 
     if delta_c == 0:
         logger.info("[concept-discovery] nothing new to add; CBL/vocab unchanged")
-        return vocab, model, lookup, pos_weight, prototypes, lda
+        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}
 
     # ---- 3. grow the CBL ----
     model.cbl = _grow_cbl(model.cbl, delta_c, device)
@@ -281,6 +290,11 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
                               device, batch_size=args.ram_batch_size)
     lab_o_by_uq = {int(u): _tags_to_o(tags, new_concepts) for u, tags in lab_tags_by_uq.items()}
 
+    # per-image targets for the NOVEL images too (new dims only -- no Grounding-DINO ground
+    # truth exists for unlabelled images at all, so only the RAM-discovered new concepts can
+    # be supervised for them). Returned for warmup_cbl_and_refit_prototypes / the main loop.
+    novel_o_by_uq = {int(u): _tags_to_o(tags_by_uq[int(u)], new_concepts) for u in novel_uq.tolist()}
+
     new_cols = torch.zeros(k_total, delta_c, device=device)
     for cid, member_uq in cluster_uqs.items():
         freqs = torch.stack([_tags_to_o(tags_by_uq[int(u)], new_concepts) for u in member_uq]).mean(0)
@@ -308,7 +322,119 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
         logger.info(f"  new concept '{c}': positive in {int(n)}/{len(lab_o_all)} labelled images "
                    f"(pos_weight={float(new_pos_weight[new_concepts.index(c)]):.1f})")
 
-    return new_vocab, model, lookup, pos_weight, prototypes, lda
+    return new_vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs
+
+
+# --------------------------------------------------------------------------- #
+# combined-target BCE: labelled (full C dims, via `lookup`) + novel (new dims only, via
+# `novel_o_by_uq`) -- gives the CBL direct supervision from BOTH populations instead of only
+# ever training the new concept dims on the labelled set, which rarely shows them (see
+# module docstring point 6 and the phase3.py discussion this closes).
+# --------------------------------------------------------------------------- #
+def combined_fidelity_bce(ell: torch.Tensor, uq: torch.Tensor, mask_lab: torch.Tensor,
+                          lab_lookup, novel_o_by_uq: Dict[int, torch.Tensor], c_old: int,
+                          pos_weight: torch.Tensor, device) -> torch.Tensor:
+    """BCE over (a) labelled rows, all C dims, target from `lab_lookup`; and (b) unlabelled
+    rows that have a RAM-derived target from novel-cluster discovery, new-dims-only, target
+    from `novel_o_by_uq`. Rows with neither (unlabelled + not in novel_o_by_uq) contribute
+    nothing, same as the original labelled-only behaviour. Returns one scalar: the sum of
+    both terms' losses divided by the total number of (row, dim) pairs actually supervised,
+    so the two populations are combined on equal per-term footing rather than per-batch."""
+    terms = []
+    n_terms = 0
+
+    if mask_lab.any():
+        o_lab = lab_lookup.batch(uq[mask_lab].cpu().tolist()).to(device)
+        terms.append(F.binary_cross_entropy_with_logits(
+            ell[mask_lab], o_lab, pos_weight=pos_weight.to(device), reduction="sum"))
+        n_terms += int(mask_lab.sum()) * ell.shape[1]
+
+    if novel_o_by_uq:
+        uq_list = uq.tolist()
+        novel_idx = [i for i, (u, lab) in enumerate(zip(uq_list, mask_lab.tolist()))
+                    if (not lab) and int(u) in novel_o_by_uq]
+        if novel_idx:
+            o_novel = torch.stack([novel_o_by_uq[int(uq_list[i])] for i in novel_idx]).to(device)
+            ell_new = ell[novel_idx][:, c_old:]
+            terms.append(F.binary_cross_entropy_with_logits(
+                ell_new, o_novel, pos_weight=pos_weight[c_old:].to(device), reduction="sum"))
+            n_terms += len(novel_idx) * o_novel.shape[1]
+
+    if not terms or n_terms == 0:
+        return torch.zeros((), device=device)
+    return sum(terms) / n_terms
+
+
+# --------------------------------------------------------------------------- #
+# CBL-only warmup (all images, combined targets) + prototype/LDA refit
+# --------------------------------------------------------------------------- #
+def warmup_cbl_and_refit_prototypes(model, merged_loader, lab_extract, unlab_extract, lab_lookup,
+                                    novel_o_by_uq: Dict[int, torch.Tensor], c_old: int, k_known: int,
+                                    k_total: int, cluster_uqs: Dict[int, List[int]],
+                                    pos_weight: torch.Tensor, args, device):
+    """Trains model.cbl (only) for `args.novel_cbl_warmup_epochs` epochs on ALL images (known
+    + novel) against combined_fidelity_bce, then recomputes `prototypes` as the TRUE mean of
+    the now-trained CBL's real output and refits the LDA metric from scratch -- replacing
+    both the RAM-frequency ASSUMPTION used at discovery time (point 5 in
+    discover_novel_concepts's docstring) and the identity-block covariance ASSUMPTION
+    (_extend_lda_block_diag) with real, measured values.
+
+    Why this matters: head.init_from_prototypes builds the classifier directly from
+    `prototypes`, assuming the CBL already produces those values -- true for a warmed-up CBL,
+    false for a freshly-grown one. Skipping this step is what caused the epoch-0 Old-ACC
+    collapse this function exists to fix.
+
+    Returns (prototypes, lda) if warmup ran, or (None, None) if
+    `args.novel_cbl_warmup_epochs <= 0` -- caller keeps its existing prototypes/lda unchanged
+    in that case.
+    """
+    if getattr(args, "novel_cbl_warmup_epochs", 0) <= 0:
+        return None, None
+
+    from methods.contrastive_training.extract import extract_concept_logits
+    from methods.gcd.lda_gaussian import LDAGaussian
+
+    optimizer = torch.optim.Adam(model.cbl.parameters(), lr=args.novel_cbl_warmup_lr)
+    model.train()
+    model.backbone.eval()
+    for epoch in range(args.novel_cbl_warmup_epochs):
+        total, nb = 0.0, 0
+        for images, _labels, uq, mask_lab in merged_loader:
+            x = images[0].to(device)
+            ell = model(x)
+            uq = uq.to(device).long()
+            mask_lab_b = mask_lab.reshape(-1).bool().to(device)
+            loss = combined_fidelity_bce(ell, uq, mask_lab_b, lab_lookup, novel_o_by_uq,
+                                         c_old, pos_weight, device)
+            if not torch.isfinite(loss):
+                logger.error(f"[concept-discovery warmup] non-finite loss at epoch {epoch+1} — aborting.")
+                raise RuntimeError("CBL warmup diverged.")
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total += float(loss); nb += 1
+        logger.info(f"[concept-discovery warmup] epoch {epoch+1}/{args.novel_cbl_warmup_epochs} "
+                   f"combined_bce={total/max(nb,1):.4f}")
+
+    # ---- refit: prototypes/LDA from the NOW-trained CBL's real output, not an assumption ----
+    model.eval()
+    lab_loader = DataLoader(lab_extract, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    unlab_loader = DataLoader(unlab_extract, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    lab_logits, lab_labels, _, _ = extract_concept_logits(model, lab_loader, device)
+    lda_new = LDAGaussian(ridge_gamma=args.lda_ridge_gamma).fit(lab_logits, lab_labels).to(device)
+
+    unlab_logits, _, unlab_uq, _ = extract_concept_logits(model, unlab_loader, device)
+    uq_to_pos = {int(u): i for i, u in enumerate(unlab_uq.tolist())}
+    novel_rows = []
+    for cid in range(k_known, k_total):
+        idx = [uq_to_pos[u] for u in cluster_uqs.get(cid, []) if u in uq_to_pos]
+        novel_rows.append(unlab_logits[idx].mean(0) if idx else torch.zeros(lda_new.C))
+    novel_means = torch.stack(novel_rows).to(device) if novel_rows else torch.zeros(0, lda_new.C, device=device)
+    prototypes_new = torch.cat([lda_new.means, novel_means], dim=0)
+
+    logger.info(f"[concept-discovery warmup] prototypes/LDA refit from post-warmup CBL "
+               f"| cond(Sigma)={float(torch.linalg.cond(lda_new.cov)):.1f}")
+    return prototypes_new, lda_new
 
 
 # --------------------------------------------------------------------------- #

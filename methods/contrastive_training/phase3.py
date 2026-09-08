@@ -37,7 +37,9 @@ from models.model_factory import build_concept_model
 from project_utils.cluster_and_log_utils import split_cluster_acc_v2
 from project_utils.general_utils import str2bool
 from project_utils.ram_tagging_utils import DEFAULT_RAM_PRETRAINED
-from project_utils.concept_discovery_utils import ConceptDriftTracker, discover_novel_concepts
+from project_utils.concept_discovery_utils import (
+    ConceptDriftTracker, combined_fidelity_bce, discover_novel_concepts,
+    warmup_cbl_and_refit_prototypes)
 
 
 @torch.no_grad()
@@ -142,11 +144,25 @@ def run_phase3(args):
     # Grows vocab/CBL/prototypes/lda/lookup/pos_weight in place if args.novel_concepts;
     # a no-op passthrough otherwise (or if no novel cluster survived the peak-gate).
     num_old_concepts = args.num_concepts
+    novel_o_by_uq, cluster_uqs = {}, {}
     if args.novel_concepts:
-        vocab, model, lookup, pos_weight, prototypes, lda = discover_novel_concepts(
+        vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs = discover_novel_concepts(
             args, model, vocab, lookup, pos_weight, prototypes, lda, k_known,
             unlab_logits, unlab_extract, lab_extract, device)
         args.num_concepts = len(vocab)
+
+    # ---- 2.c. CBL warmup (all images, combined known+novel targets) + prototype/LDA refit ----
+    # Off by default (--novel_cbl_warmup_epochs 0). When on, replaces the RAM-frequency
+    # ASSUMPTION baked into new-dim prototypes/LDA at discovery time with real values measured
+    # from a CBL that's actually been trained on those dims -- see
+    # warmup_cbl_and_refit_prototypes's docstring for why that fixes the epoch-0 Old-ACC
+    # collapse a freshly-grown, untrained CBL otherwise causes.
+    new_prototypes, new_lda = warmup_cbl_and_refit_prototypes(
+        model, merged_train, lab_extract, unlab_extract, lookup, novel_o_by_uq,
+        num_old_concepts, k_known, k_total, cluster_uqs, pos_weight, args, device)
+    if new_prototypes is not None:
+        prototypes, lda = new_prototypes, new_lda
+
     drift = ConceptDriftTracker(k_known, k_total, num_old_concepts, vocab, prototypes)
 
     # ---- 3. head, initialised from the (gated) prototypes ----
@@ -209,7 +225,13 @@ def run_phase3(args):
             ce_all = F.cross_entropy(logits, targets.clamp(0, k_total - 1), reduction="none")
             denom = w.sum().clamp_min(1.0)
             L_ce = (ce_all * w).sum() / denom
-            if mask_lab.any():
+            if args.novel_bce_include_unlabelled and novel_o_by_uq:
+                # combined target: labelled (full C dims) + novel (new dims only, RAM-derived)
+                # -- gives the CBL direct supervision from the images that actually motivated
+                # each new concept, not just the labelled set (which rarely shows them).
+                L_bce = combined_fidelity_bce(ell, uq, mask_lab, lookup, novel_o_by_uq,
+                                              num_old_concepts, pos_weight, device)
+            elif mask_lab.any():
                 o = lookup.batch(uq[mask_lab].cpu().tolist()).to(device)
                 L_bce = fidelity_bce(ell[mask_lab], o, pos_weight)
             else:
@@ -300,6 +322,15 @@ def get_phase3_parser():
                    help="per novel cluster: nearest-to-center images + finalized concepts -> <this>/<cluster_id>/")
     p.add_argument("--cluster_images_n", type=int, default=20,
                    help="how many nearest-to-center member images to save per novel cluster")
+    p.add_argument("--novel_cbl_warmup_epochs", type=int, default=0,
+                   help="epochs to pre-train the (just-grown) CBL on ALL images against combined "
+                        "known+novel targets before building the head from prototypes (0 = off, "
+                        "keeps the RAM-frequency-assumption prototypes/LDA from discovery as-is)")
+    p.add_argument("--novel_cbl_warmup_lr", type=float, default=1e-3,
+                   help="Adam LR for the CBL-only warmup stage")
+    p.add_argument("--novel_bce_include_unlabelled", type=str2bool, default=False,
+                   help="in the main training loop, also supervise the new concept dims on "
+                        "unlabelled/novel images (RAM-derived targets), not just labelled ones")
     # Grounding DINO (labelled-set targets for newly discovered concepts; not installed by
     # default here -- see grounding_dino_tagging.py's docstring)
     p.add_argument("--gdino_config", type=str,
