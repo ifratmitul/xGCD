@@ -65,9 +65,12 @@ spec:
             if [ "$SMOKE" = "1" ]; then
                 STAGE1_EPOCHS=2; REFRESH=2; P3_EPOCHS=4
             else
-                # 80 known classes + a larger concept vocabulary -> Stage 1 may want more
-                # epochs than CIFAR-10; bump STAGE1_EPOCHS if the CBL is under-trained.
-                STAGE1_EPOCHS=50; REFRESH=2; P3_EPOCHS=15
+                # FINAL run: CE on (P3_EPOCHS=15) at the locked operating point beta=0.01,
+                # gamma=0.1 (K^n=18). Cleanup all OFF: on CIFAR-100 the peak populations are
+                # interleaved (real 0.42-0.95, junk 0.25-0.92) so any gate drops real classes
+                # (permanent), and absorb/merge distances overlap. Keep all 18 -> CE trains 98
+                # classes; the 3-4 bad clusters cost only a few Hungarian columns (cheap error).
+                STAGE1_EPOCHS=50; REFRESH=2; P3_EPOCHS=30
             fi
 
             # ---- estimation geometry (same recipe as CIFAR-10; recalibrate after run 1) ----
@@ -76,10 +79,22 @@ spec:
             NOVELTY_ALPHA="0.2"     # may need raising: 80 known classes strengthen absorption bias
             TAU_MODE="empirical"
             GRAD_CLIP="1.0"
-            LDA_RIDGE="0.1"         # bump to 0.2 if cond(Sigma) climbs past ~150 (larger C)
+            LDA_RIDGE="0.1"         # reverted: gamma=1.0 did NOT help the gate (recall 0.55->0.55,
+                                    # purity 55->57, overlap unchanged) and collapsed K^n 18->4.
+                                    # The known/novel overlap is FUNDAMENTAL, not a conditioning issue.
             DPMM_COV_SCALE="1.0"
             DPMM_ALPHA="1.0"
+            # new-table barrier = C*ln(1+beta). beta=0.07 (~49 nats, CIFAR-10-matched) broke the
+            # K=1 collapse but UNDER-split (K=6; 3 mega-blobs merging ~15 classes). CIFAR-100's
+            # 20 novel classes sit closer than CIFAR-10's 5, so the bar must be lower: try 0.03
+            # (~21 nats). If still under-split, 0.01 (~7 nats); watch for over-split into junk.
+            DPMM_BETA="0.01"
             DPMM_SEED="42"
+            # min-cluster prune floor = max(SIZE, FRAC*pool). CIFAR-10 used 1% (=~205 on its 20k
+            # pool). Here novel classes are SMALL (pool has 37-458 per class): a 1% floor (~100)
+            # would erase c96(37)/c95(124) before the DPMM can count them. Use max(30, 0.3%).
+            DPMM_MIN_CLUSTER_SIZE="30"
+            DPMM_MIN_CLUSTER_FRAC="0.003"
 
             # ---- cluster-level cleanup: OFF for the calibration run (log-only) ----
             DPMM_ABSORB="False"     # -> read the [absorb] distance table, then set ABSORB_SCALE
@@ -93,9 +108,10 @@ spec:
             CE_WEIGHT="1.0"
             HEAD_LR="1e-2"
             LABELLED_WARMUP="0"     # 0: labelled-only warmup destabilised the CIFAR-10 head
-            CONF_TEMP="0.0"         # 0 = use C (auto-scales with the larger CIFAR-100 vocabulary)
+            CONF_TEMP="50"          # was 0(=C=727): over-flattened confidence to ~uniform (0.014).
+                                    # ~50 gives a usable spread once K>1 (inert while K=1)
             REF_ACC="0.0"           # placeholder — no CIFAR-100 reference yet (log-only comparison)
-            P3_EXP="phase3_cifar100_8020_calib"
+            P3_EXP="phase3_cifar100_8020_final"
 
             # ============================================================
             # Stage 1 — fresh, seeded CBL (80 known classes)
@@ -157,6 +173,9 @@ spec:
                 --lda_ridge_gamma "$LDA_RIDGE" \
                 --dpmm_cov_scale "$DPMM_COV_SCALE" \
                 --dpmm_alpha "$DPMM_ALPHA" \
+                --dpmm_beta "$DPMM_BETA" \
+                --dpmm_min_cluster_size "$DPMM_MIN_CLUSTER_SIZE" \
+                --dpmm_min_cluster_frac "$DPMM_MIN_CLUSTER_FRAC" \
                 --dpmm_seed "$DPMM_SEED" \
                 --dpmm_absorb "$DPMM_ABSORB" \
                 --dpmm_merge "$DPMM_MERGE" \
@@ -205,11 +224,11 @@ spec:
           requests:
             memory: "16Gi"
             cpu: "2"
-            nvidia.com/rtxa6000: 1
+            nvidia.com/gpu: 1
           limits:
             memory: "16Gi"
             cpu: "2"
-            nvidia.com/rtxa6000: 1
+            nvidia.com/gpu: 1
         env:
         - name: WANDB_API_KEY
           value: "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"

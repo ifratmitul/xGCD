@@ -421,7 +421,11 @@ def get_xgcd_parser():
     p.add_argument("--dpmm_beta", type=float, default=1.0)
     p.add_argument("--dpmm_sweeps", type=int, default=30)
     p.add_argument("--dpmm_max_points", type=int, default=8000)
-    p.add_argument("--dpmm_min_cluster_size", type=int, default=10)
+    p.add_argument("--dpmm_min_cluster_size", type=int, default=10,
+                   help="absolute floor: dissolve DPMM clusters smaller than this")
+    p.add_argument("--dpmm_min_cluster_frac", type=float, default=0.01,
+                   help="fractional floor: dissolve DPMM clusters below frac*|pool|. LOWER for "
+                        "small novel classes (1%% erases a class with <1%% of the pool)")
     p.add_argument("--dpmm_min_pool", type=int, default=10)
     p.add_argument("--dpmm_seed", type=int, default=42, help="DPMM Gibbs seed")
     p.add_argument("--dpmm_patience", type=int, default=3,

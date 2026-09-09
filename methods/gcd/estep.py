@@ -266,6 +266,7 @@ def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
     dpmm_sweeps = getattr(args, "dpmm_sweeps", 30)
     dpmm_max_pts = getattr(args, "dpmm_max_points", 8000)
     dpmm_min_cluster = getattr(args, "dpmm_min_cluster_size", 10)
+    dpmm_min_cluster_frac = getattr(args, "dpmm_min_cluster_frac", 0.01)
     min_novel = getattr(args, "dpmm_min_pool", 10)
     dpmm_seed = getattr(args, "dpmm_seed", 42)
     dpmm_patience = int(getattr(args, "dpmm_patience", 3))
@@ -341,6 +342,7 @@ def run_estep(labelled_logits: torch.Tensor, labelled_labels: torch.Tensor,
         m0 = unlab_logits.mean(0)                  # empirical-Bayes base-measure mean
         dpmm_kwargs = dict(alpha=dpmm_alpha, beta=dpmm_beta, n_sweeps=dpmm_sweeps,
                            max_points=dpmm_max_pts, min_cluster_size=dpmm_min_cluster,
+                           min_cluster_frac=dpmm_min_cluster_frac,
                            patience=dpmm_patience, seed=dpmm_seed)
         dp, s_applied, s_measured = _fit_dpmm(pool, lda, m0, args, dpmm_kwargs)
         pool_gt = unlab_labels[nov.novel_idx].cpu() if unlab_labels is not None else None
