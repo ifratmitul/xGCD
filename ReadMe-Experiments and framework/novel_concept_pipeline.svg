@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 480" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#333333" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <text x="450" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#111111">Novel-Concept Discovery and Training Pipeline</text>
+
+  <!-- ============ Phase band backgrounds ============ -->
+  <rect x="20" y="40" width="860" height="130" rx="10" fill="#F2F6FC" stroke="#C7D6EC" stroke-width="1"/>
+  <text x="36" y="58" font-size="12" font-weight="bold" fill="#3A5A96">PHASE 1 — Concept Discovery</text>
+
+  <rect x="20" y="188" width="860" height="130" rx="10" fill="#EFF7F1" stroke="#BFE0CB" stroke-width="1"/>
+  <text x="36" y="206" font-size="12" font-weight="bold" fill="#2E7D4F">PHASE 2 — Verification &amp; Expansion</text>
+
+  <rect x="20" y="336" width="860" height="130" rx="10" fill="#FBF3E8" stroke="#EAD0A8" stroke-width="1"/>
+  <text x="36" y="354" font-size="12" font-weight="bold" fill="#A9660F">PHASE 3 — Expanded CBL Training</text>
+
+  <!-- ============ Row 1 : Discovery ============ -->
+  <g>
+    <rect x="50" y="66" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#5B7FBF" stroke-width="1.5"/>
+    <text x="165" y="96" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">Fixed Clusters</text>
+    <text x="165" y="116" text-anchor="middle" font-size="11" fill="#444444">known + novel clusters</text>
+    <text x="165" y="132" text-anchor="middle" font-size="10" fill="#7A8BA6">(DPMM, gate already run)</text>
+  </g>
+  <g>
+    <rect x="315" y="66" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#5B7FBF" stroke-width="1.5"/>
+    <text x="430" y="96" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">Representative Images</text>
+    <text x="430" y="116" text-anchor="middle" font-size="11" fill="#444444">nearest 80% to center</text>
+    <text x="430" y="132" text-anchor="middle" font-size="10" fill="#7A8BA6">novel clusters only</text>
+  </g>
+  <g>
+    <rect x="580" y="66" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#5B7FBF" stroke-width="1.5"/>
+    <text x="695" y="96" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">VLM Concept Tagging</text>
+    <text x="695" y="116" text-anchor="middle" font-size="11" fill="#444444">image tags -&gt; candidate concepts</text>
+    <text x="695" y="132" text-anchor="middle" font-size="10" fill="#3A5A96" font-weight="bold">Model: RAM++</text>
+  </g>
+  <line x1="280" y1="106" x2="315" y2="106" stroke="#333333" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="545" y1="106" x2="580" y2="106" stroke="#333333" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- connector phase1 -> phase2 -->
+  <path d="M695,146 L695,178 L165,178 L165,188" fill="none" stroke="#333333" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ============ Row 2 : Verification + Expansion ============ -->
+  <g>
+    <rect x="50" y="214" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#4C9A6E" stroke-width="1.5"/>
+    <text x="165" y="244" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">Concept Cleaning</text>
+    <text x="165" y="264" text-anchor="middle" font-size="11" fill="#444444">drop near-universal-in-known</text>
+    <text x="165" y="280" text-anchor="middle" font-size="10" fill="#7A8BA6">threshold = 0.5</text>
+  </g>
+  <g>
+    <rect x="315" y="214" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#4C9A6E" stroke-width="1.5"/>
+    <text x="430" y="244" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">Visual Grounding (T)</text>
+    <text x="430" y="264" text-anchor="middle" font-size="11" fill="#444444">verify concepts on ALL images</text>
+    <text x="430" y="280" text-anchor="middle" font-size="10" fill="#2E7D4F" font-weight="bold">Model: RAM++ / Grounding DINO</text>
+  </g>
+  <g>
+    <rect x="580" y="214" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#4C9A6E" stroke-width="1.5"/>
+    <text x="695" y="244" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">Concept-Space Expansion</text>
+    <text x="695" y="264" text-anchor="middle" font-size="11" fill="#444444">[ O_known ; O_novel ]</text>
+    <text x="695" y="280" text-anchor="middle" font-size="10" fill="#7A8BA6">CBL output grows M_K -&gt; M_K+M_N</text>
+  </g>
+  <line x1="280" y1="254" x2="315" y2="254" stroke="#333333" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="545" y1="254" x2="580" y2="254" stroke="#333333" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- connector phase2 -> phase3 -->
+  <path d="M695,294 L695,326 L165,326 L165,336" fill="none" stroke="#333333" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ============ Row 3 : Training detail ============ -->
+  <g>
+    <rect x="50" y="362" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#C98A3A" stroke-width="1.5"/>
+    <text x="165" y="392" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">1. Warm-up</text>
+    <text x="165" y="412" text-anchor="middle" font-size="11" fill="#444444">train concept layer only</text>
+    <text x="165" y="428" text-anchor="middle" font-size="10" fill="#A9660F">before classifier head init</text>
+  </g>
+  <g>
+    <rect x="315" y="362" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#C98A3A" stroke-width="1.5"/>
+    <text x="430" y="392" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">2. Freeze Known Rows</text>
+    <text x="430" y="412" text-anchor="middle" font-size="11" fill="#444444">restored after every step</text>
+    <text x="430" y="428" text-anchor="middle" font-size="10" fill="#A9660F">known concepts fixed at Stage-1</text>
+  </g>
+  <g>
+    <rect x="580" y="362" width="230" height="80" rx="8" fill="#FFFFFF" stroke="#C98A3A" stroke-width="1.5"/>
+    <text x="695" y="392" text-anchor="middle" font-size="13" font-weight="bold" fill="#111111">3. Novel-Only Training</text>
+    <text x="695" y="412" text-anchor="middle" font-size="11" fill="#444444">new concepts: novel images only</text>
+    <text x="695" y="428" text-anchor="middle" font-size="10" fill="#A9660F">weight = novel-population rarity</text>
+  </g>
+  <line x1="280" y1="402" x2="315" y2="402" stroke="#333333" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="545" y1="402" x2="580" y2="402" stroke="#333333" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- footnote -->
+  <text x="450" y="472" text-anchor="middle" font-size="10" fill="#777777">Concepts common to both known and novel populations may also be removed (future work).</text>
+</svg>
