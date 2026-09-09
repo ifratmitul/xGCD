@@ -186,18 +186,20 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
                             prototypes: torch.Tensor, lda, k_known: int,
                             unlab_logits: torch.Tensor, unlab_extract, lab_extract, device
                             ) -> Tuple[List[str], object, object, torch.Tensor, torch.Tensor, object,
-                                      Dict[int, torch.Tensor], Dict[int, List[int]]]:
-    """Returns (vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs),
-    all possibly grown. `novel_o_by_uq` ({uq: [delta_c] 0/1}) and `cluster_uqs`
-    ({cluster_id: [uq...]}) are the per-image RAM targets and cluster membership for the
-    *novel* images -- reused by warmup_cbl_and_refit_prototypes and the main training loop's
-    combined_fidelity_bce so novel images finally get direct supervision on the concepts
-    that were discovered from them, instead of only ever influencing the CBL indirectly
-    through the CE/pseudo-label loss."""
+                                      Dict[int, torch.Tensor], Dict[int, List[int]], torch.Tensor]:
+    """Returns (vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs,
+    novel_pos_weight), all possibly grown. `novel_o_by_uq` ({uq: [delta_c] 0/1}) and
+    `cluster_uqs` ({cluster_id: [uq...]}) are the per-image RAM targets and cluster
+    membership for the *novel* images -- reused by warmup_cbl_and_refit_prototypes and the
+    main training loop's combined_fidelity_bce so novel images finally get direct
+    supervision on the concepts that were discovered from them, instead of only ever
+    influencing the CBL indirectly through the CE/pseudo-label loss. `novel_pos_weight` is
+    `pos_weight`'s new-dim columns recomputed from novel-population frequency instead of
+    labelled frequency -- see its computation below for why that distinction matters."""
     k_total = prototypes.shape[0]
     if k_total <= k_known:
         logger.info("[concept-discovery] no novel clusters survived the peak-gate; skipping")
-        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}
+        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}, pos_weight
 
     assignments = assign_to_prototypes(unlab_logits, prototypes, lda).cpu().numpy()
     novel_mask = assignments >= k_known
@@ -206,7 +208,7 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
                f"fell in a novel cluster (k_known={k_known}, k_total={k_total})")
     if n_novel_imgs == 0:
         logger.info("[concept-discovery] no unlabelled images landed in a novel cluster; skipping")
-        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}
+        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}, pos_weight
 
     ram_model, ram_transform = load_ram_plus(args.ram_pretrained, args.ram_image_size, device)
 
@@ -295,7 +297,7 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
 
     if delta_c == 0:
         logger.info("[concept-discovery] nothing new to add; CBL/vocab unchanged")
-        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}
+        return vocab, model, lookup, pos_weight, prototypes, lda, {}, {}, pos_weight
 
     # ---- 3. grow the CBL ----
     model.cbl = _grow_cbl(model.cbl, delta_c, device)
@@ -348,14 +350,39 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
     pos_weight = torch.cat([pos_weight.cpu(), new_pos_weight])
     lookup = ExtendedConceptLookup(lookup, new_concepts, lab_o_by_uq)
 
+    # ---- novel-population pos_weight for the same new concepts ----
+    # A concept's rarity in the LABELLED set has little to do with its rarity in the NOVEL
+    # population it was actually discovered from -- e.g. "tree frog" is ~0% of labelled images
+    # (pos_weight~1, barely amplified) but a real, frequent signal within its own novel
+    # cluster. Reusing the labelled-derived pos_weight to also scale the novel BCE term
+    # systematically underweights exactly the concepts that matter most there. This is that
+    # concept's rarity measured in `novel_o_by_uq`'s own population instead: every unlabelled
+    # image CURRENTLY assigned to a novel cluster (assignments >= k_known) -- including a
+    # truly-known image the gate leaked into one, since the pipeline can only ever act on its
+    # current belief, never ground truth; NOT including a known image the gate correctly kept
+    # in a known cluster, since that image was never in `novel_o_by_uq` to begin with.
+    novel_o_all = torch.stack(list(novel_o_by_uq.values())) if novel_o_by_uq else torch.zeros(0, delta_c)
+    novel_pos = novel_o_all.sum(0)
+    novel_neg = novel_o_all.shape[0] - novel_pos
+    new_novel_pos_weight = torch.where(novel_pos > 0, novel_neg / novel_pos.clamp_min(1.0),
+                                       torch.ones_like(novel_pos))
+    if getattr(args, "pos_weight_clip", 0) > 0:
+        new_novel_pos_weight = new_novel_pos_weight.clamp(max=args.pos_weight_clip)
+    # old-dim portion is a placeholder (unused -- combined_fidelity_bce's novel branch only
+    # ever reads novel_pos_weight[c_old:]); kept as the pre-extension labelled pos_weight
+    # purely so the array has the same length/shape as `pos_weight` for uniform slicing.
+    c_old = len(vocab)
+    novel_pos_weight = torch.cat([pos_weight[:c_old].cpu(), new_novel_pos_weight])
+
     known_hit_frac = float((lab_o_all.sum(1) > 0).float().mean()) if len(lab_o_all) else 0.0
     logger.info(f"[concept-discovery] {known_hit_frac*100:.1f}% of labelled/known images show "
                f">=1 of the {delta_c} newly discovered concepts (RAM-recomputed, not forced to 0)")
-    for c, n in zip(new_concepts, pos.tolist()):
-        logger.info(f"  new concept '{c}': positive in {int(n)}/{len(lab_o_all)} labelled images "
-                   f"(pos_weight={float(new_pos_weight[new_concepts.index(c)]):.1f})")
+    for i, c in enumerate(new_concepts):
+        logger.info(f"  new concept '{c}': labelled {int(pos[i])}/{len(lab_o_all)} "
+                   f"(pos_weight={float(new_pos_weight[i]):.1f}) | novel {int(novel_pos[i])}/{len(novel_o_all)} "
+                   f"(pos_weight={float(new_novel_pos_weight[i]):.1f})")
 
-    return new_vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs
+    return new_vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs, novel_pos_weight
 
 
 # --------------------------------------------------------------------------- #
@@ -366,7 +393,8 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
 # --------------------------------------------------------------------------- #
 def combined_fidelity_bce(ell: torch.Tensor, uq: torch.Tensor, mask_lab: torch.Tensor,
                           lab_lookup, novel_o_by_uq: Dict[int, torch.Tensor], c_old: int,
-                          pos_weight: torch.Tensor, device, novel_only: bool = False) -> torch.Tensor:
+                          pos_weight: torch.Tensor, device, novel_only: bool = False,
+                          novel_pos_weight: torch.Tensor = None) -> torch.Tensor:
     """BCE over (a) labelled rows, all C dims, target from `lab_lookup`; and (b) unlabelled
     rows that have a RAM-derived target from novel-cluster discovery, new-dims-only, target
     from `novel_o_by_uq`. Rows with neither (unlabelled + not in novel_o_by_uq) contribute
@@ -380,7 +408,15 @@ def combined_fidelity_bce(ell: torch.Tensor, uq: torch.Tensor, mask_lab: torch.T
     frozen old dims, there's nothing to gain from also training the new dims on known images
     -- and per-concept quality actually suffers, since a concept like "blue" that's common to
     many different, unrelated clusters gets diluted by cross-population averaging instead of
-    describing any one cluster distinctly."""
+    describing any one cluster distinctly.
+
+    `novel_pos_weight`: if given, used for term (b) instead of `pos_weight[c_old:]`. A
+    concept's rarity in the LABELLED population (what `pos_weight` measures) can be
+    completely unrelated to its rarity in the NOVEL population term (b) actually trains
+    on -- e.g. a concept near-absent from labelled images but common within its own novel
+    cluster gets barely amplified (pos_weight~1) under the labelled-derived weight, even
+    though it's exactly the concept that should matter most there. Falls back to
+    `pos_weight[c_old:]` when None (the original behaviour)."""
     terms = []
     n_terms = 0
 
@@ -397,8 +433,9 @@ def combined_fidelity_bce(ell: torch.Tensor, uq: torch.Tensor, mask_lab: torch.T
         if novel_idx:
             o_novel = torch.stack([novel_o_by_uq[int(uq_list[i])] for i in novel_idx]).to(device)
             ell_new = ell[novel_idx][:, c_old:]
+            pw_novel = novel_pos_weight[c_old:] if novel_pos_weight is not None else pos_weight[c_old:]
             terms.append(F.binary_cross_entropy_with_logits(
-                ell_new, o_novel, pos_weight=pos_weight[c_old:].to(device), reduction="sum"))
+                ell_new, o_novel, pos_weight=pw_novel.to(device), reduction="sum"))
             n_terms += len(novel_idx) * o_novel.shape[1]
 
     if not terms or n_terms == 0:
@@ -413,7 +450,7 @@ def warmup_cbl_and_refit_prototypes(model, merged_loader, lab_extract, unlab_ext
                                     novel_o_by_uq: Dict[int, torch.Tensor], c_old: int, k_known: int,
                                     k_total: int, cluster_uqs: Dict[int, List[int]],
                                     pos_weight: torch.Tensor, args, device, frozen=None,
-                                    novel_only: bool = False):
+                                    novel_only: bool = False, novel_pos_weight: torch.Tensor = None):
     """Trains model.cbl (only) for `args.novel_cbl_warmup_epochs` epochs against
     combined_fidelity_bce, then recomputes `prototypes` as the TRUE mean of the now-trained
     CBL's real output and refits the LDA metric from scratch -- replacing both the
@@ -454,7 +491,8 @@ def warmup_cbl_and_refit_prototypes(model, merged_loader, lab_extract, unlab_ext
             uq = uq.to(device).long()
             mask_lab_b = mask_lab.reshape(-1).bool().to(device)
             loss = combined_fidelity_bce(ell, uq, mask_lab_b, lab_lookup, novel_o_by_uq,
-                                         c_old, pos_weight, device, novel_only=novel_only)
+                                         c_old, pos_weight, device, novel_only=novel_only,
+                                         novel_pos_weight=novel_pos_weight)
             if not torch.isfinite(loss):
                 logger.error(f"[concept-discovery warmup] non-finite loss at epoch {epoch+1} — aborting.")
                 raise RuntimeError("CBL warmup diverged.")

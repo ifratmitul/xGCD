@@ -146,11 +146,14 @@ def run_phase3(args):
     # a no-op passthrough otherwise (or if no novel cluster survived the peak-gate).
     num_old_concepts = args.num_concepts
     novel_o_by_uq, cluster_uqs = {}, {}
+    novel_pos_weight = None
     if args.novel_concepts:
-        vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs = discover_novel_concepts(
+        vocab, model, lookup, pos_weight, prototypes, lda, novel_o_by_uq, cluster_uqs, novel_pos_weight = discover_novel_concepts(
             args, model, vocab, lookup, pos_weight, prototypes, lda, k_known,
             unlab_logits, unlab_extract, lab_extract, device)
         args.num_concepts = len(vocab)
+        if not args.novel_pos_weight_from_novel:
+            novel_pos_weight = None   # opt-in only (--novel_pos_weight_from_novel); see arg help
 
     # ---- 2.c. freeze the OLD CBL rows (structural, for the rest of phase 3) ----
     # Off by default (--novel_freeze_old_cbl False). When on, snapshots the just-grown CBL's
@@ -178,7 +181,7 @@ def run_phase3(args):
     new_prototypes, new_lda = warmup_cbl_and_refit_prototypes(
         model, merged_train, lab_extract, unlab_extract, lookup, novel_o_by_uq,
         num_old_concepts, k_known, k_total, cluster_uqs, pos_weight, args, device,
-        frozen=frozen, novel_only=args.novel_freeze_old_cbl)
+        frozen=frozen, novel_only=args.novel_freeze_old_cbl, novel_pos_weight=novel_pos_weight)
     if new_prototypes is not None:
         prototypes, lda = new_prototypes, new_lda
 
@@ -250,13 +253,15 @@ def run_phase3(args):
                 # on labelled images -- novel_only skips that term entirely (see
                 # combined_fidelity_bce's docstring for the concept-quality reason too).
                 L_bce = combined_fidelity_bce(ell, uq, mask_lab, lookup, novel_o_by_uq,
-                                              num_old_concepts, pos_weight, device, novel_only=True)
+                                              num_old_concepts, pos_weight, device, novel_only=True,
+                                              novel_pos_weight=novel_pos_weight)
             elif args.novel_bce_include_unlabelled and novel_o_by_uq:
                 # combined target: labelled (full C dims) + novel (new dims only, RAM-derived)
                 # -- gives the CBL direct supervision from the images that actually motivated
                 # each new concept, not just the labelled set (which rarely shows them).
                 L_bce = combined_fidelity_bce(ell, uq, mask_lab, lookup, novel_o_by_uq,
-                                              num_old_concepts, pos_weight, device)
+                                              num_old_concepts, pos_weight, device,
+                                              novel_pos_weight=novel_pos_weight)
             elif mask_lab.any():
                 o = lookup.batch(uq[mask_lab].cpu().tolist()).to(device)
                 L_bce = fidelity_bce(ell[mask_lab], o, pos_weight)
@@ -370,6 +375,13 @@ def get_phase3_parser():
                         "after every optimizer step, including during warmup) and train the new "
                         "concept dims on novel images only, never labelled ones -- known concept "
                         "detection then stays byte-for-byte identical to Stage 1 throughout")
+    p.add_argument("--novel_pos_weight_from_novel", type=str2bool, default=False,
+                   help="weight the new concepts' novel-image BCE term by their rarity WITHIN "
+                        "the novel population (assignments >= k_known, whatever the pipeline "
+                        "currently believes is novel) instead of their rarity in the labelled "
+                        "set -- a concept can be near-absent from labelled images (barely "
+                        "amplified under the labelled-derived weight) while being common and "
+                        "discriminative within the novel cluster that actually discovered it")
     # Grounding DINO (labelled-set targets for newly discovered concepts; not installed by
     # default here -- see grounding_dino_tagging.py's docstring)
     p.add_argument("--gdino_config", type=str,
