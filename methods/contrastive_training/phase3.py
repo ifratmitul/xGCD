@@ -40,6 +40,7 @@ from project_utils.ram_tagging_utils import DEFAULT_RAM_PRETRAINED
 from project_utils.concept_discovery_utils import (
     ConceptDriftTracker, combined_fidelity_bce, discover_novel_concepts,
     warmup_cbl_and_refit_prototypes)
+from project_utils.freeze_old_concepts_cbl_utils import FrozenCBLRows
 
 
 @torch.no_grad()
@@ -151,7 +152,24 @@ def run_phase3(args):
             unlab_logits, unlab_extract, lab_extract, device)
         args.num_concepts = len(vocab)
 
-    # ---- 2.c. CBL warmup (all images, combined known+novel targets) + prototype/LDA refit ----
+    # ---- 2.c. freeze the OLD CBL rows (structural, for the rest of phase 3) ----
+    # Off by default (--novel_freeze_old_cbl False). When on, snapshots the just-grown CBL's
+    # first num_old_concepts rows RIGHT NOW -- before warmup or the main loop ever touch them
+    # -- and restores that snapshot after every optimizer step from here on (including inside
+    # warmup). Known-class concept detection then stays byte-for-byte identical to Stage 1
+    # for the rest of the run: not just unaffected by the new concepts, but structurally
+    # unable to drift from anything CE/BCE do to the newly-grown rows. See
+    # freeze_old_concepts_cbl_utils.py's docstring for why this needs a restore-after-step
+    # rather than just freezing gradients (SGD's weight_decay term still nudges a
+    # zero-gradient row otherwise).
+    frozen = None
+    if args.novel_concepts and args.num_concepts > num_old_concepts and args.novel_freeze_old_cbl:
+        frozen = FrozenCBLRows(model.cbl, num_old_concepts)
+        logger.info(f"[phase3] froze the original {num_old_concepts} CBL concept rows -- "
+                   f"they will not change for the rest of this run")
+
+    # ---- 2.d. CBL warmup (combined or novel-only targets, per novel_freeze_old_cbl) +
+    #           prototype/LDA refit ----
     # Off by default (--novel_cbl_warmup_epochs 0). When on, replaces the RAM-frequency
     # ASSUMPTION baked into new-dim prototypes/LDA at discovery time with real values measured
     # from a CBL that's actually been trained on those dims -- see
@@ -159,7 +177,8 @@ def run_phase3(args):
     # collapse a freshly-grown, untrained CBL otherwise causes.
     new_prototypes, new_lda = warmup_cbl_and_refit_prototypes(
         model, merged_train, lab_extract, unlab_extract, lookup, novel_o_by_uq,
-        num_old_concepts, k_known, k_total, cluster_uqs, pos_weight, args, device)
+        num_old_concepts, k_known, k_total, cluster_uqs, pos_weight, args, device,
+        frozen=frozen, novel_only=args.novel_freeze_old_cbl)
     if new_prototypes is not None:
         prototypes, lda = new_prototypes, new_lda
 
@@ -170,34 +189,6 @@ def run_phase3(args):
     head.init_from_prototypes(prototypes, lda.precision)
     conf_temp = args.conf_temp if args.conf_temp > 0 else float(args.num_concepts)
     logger.info(f"[phase3] head init from {k_total} prototypes | conf_temp={conf_temp:.1f}")
-
-    # ---- 3.b known-class rows use OLD concepts only (structural, not just trained-toward) ----
-    # logit = W . ell + b; zeroing W's new-dim columns for known rows means a known class's
-    # score literally cannot depend on the new concepts' values, whatever CE does elsewhere.
-    # Novel rows are untouched -- they're supposed to use the full concept set. Re-applied
-    # after every optimizer step below so training can't drift these back away from zero.
-    #
-    # IMPORTANT: W/b must be RECOMPUTED from the old-dim SUB-BLOCK of precision + prototypes,
-    # not computed jointly (full C-dim precision) and then masked. lda.precision is a real,
-    # densely-fit matrix once warmup runs its full LDA refit -- its old/new blocks have
-    # non-zero cross-terms, so a jointly-computed W's "old-dim" columns are already
-    # contaminated by the new dims' prototype values through those cross-terms, before any
-    # masking happens. Zeroing columns afterward doesn't undo that. Recomputing from the
-    # old-dim sub-block alone reproduces exactly what a classifier over the original concept
-    # space would have been -- genuinely decoupled, not just superficially so.
-    known_rows_old_dims_only = args.novel_concepts and args.num_concepts > num_old_concepts and args.novel_known_classes_use_old_concepts_only
-    if known_rows_old_dims_only:
-        with torch.no_grad():
-            c_old = num_old_concepts
-            P_old = lda.precision[:c_old, :c_old]
-            proto_old = prototypes[:k_known, :c_old]
-            W_old = proto_old @ P_old
-            head.fc.weight[:k_known, :c_old] = W_old
-            head.fc.weight[:k_known, c_old:] = 0.0
-            head.fc.bias[:k_known] = -0.5 * (W_old * proto_old).sum(dim=1)
-        logger.info(f"[phase3] known-class head rows restricted to the original {num_old_concepts} "
-                   f"concepts (recomputed from the old-dim precision sub-block, not masked "
-                   f"post-hoc) -- known classification structurally unaffected by the new concepts")
 
     # ---- 4. pseudo-labels by uq: GT for labelled, head-argmax for unlabelled ----
     max_uq = int(max(int(lab_uq.max()), int(unlab_uq.max()))) + 1
@@ -253,7 +244,14 @@ def run_phase3(args):
             ce_all = F.cross_entropy(logits, targets.clamp(0, k_total - 1), reduction="none")
             denom = w.sum().clamp_min(1.0)
             L_ce = (ce_all * w).sum() / denom
-            if args.novel_bce_include_unlabelled and novel_o_by_uq:
+            if args.novel_freeze_old_cbl and novel_o_by_uq:
+                # old CBL rows are frozen (restored below regardless of what loss/gradient
+                # touches them), so there's nothing to gain from also training the new dims
+                # on labelled images -- novel_only skips that term entirely (see
+                # combined_fidelity_bce's docstring for the concept-quality reason too).
+                L_bce = combined_fidelity_bce(ell, uq, mask_lab, lookup, novel_o_by_uq,
+                                              num_old_concepts, pos_weight, device, novel_only=True)
+            elif args.novel_bce_include_unlabelled and novel_o_by_uq:
                 # combined target: labelled (full C dims) + novel (new dims only, RAM-derived)
                 # -- gives the CBL direct supervision from the images that actually motivated
                 # each new concept, not just the labelled set (which rarely shows them).
@@ -274,9 +272,8 @@ def run_phase3(args):
                 torch.nn.utils.clip_grad_norm_(
                     list(head.parameters()) + list(model.cbl.parameters()), args.grad_clip)
             optimizer.step()
-            if known_rows_old_dims_only:
-                with torch.no_grad():
-                    head.fc.weight[:k_known, num_old_concepts:].zero_()
+            if frozen is not None:
+                frozen.restore(model.cbl)
             agg["ce"] += float(L_ce); agg["bce"] += float(L_bce); agg["loss"] += float(loss); nb += 1
         for k in agg:
             agg[k] /= max(nb, 1)
@@ -366,11 +363,13 @@ def get_phase3_parser():
                    help="Adam LR for the CBL-only warmup stage")
     p.add_argument("--novel_bce_include_unlabelled", type=str2bool, default=False,
                    help="in the main training loop, also supervise the new concept dims on "
-                        "unlabelled/novel images (RAM-derived targets), not just labelled ones")
-    p.add_argument("--novel_known_classes_use_old_concepts_only", type=str2bool, default=False,
-                   help="zero the head's new-concept weights for KNOWN class rows (kept at zero "
-                        "throughout training) so known classification structurally can't depend "
-                        "on the new concepts, even though the CBL still learns them from all images")
+                        "unlabelled/novel images (RAM-derived targets), not just labelled ones. "
+                        "Ignored when --novel_freeze_old_cbl is on (that implies novel-only)")
+    p.add_argument("--novel_freeze_old_cbl", type=str2bool, default=False,
+                   help="freeze the original CBL concept rows for the rest of phase 3 (restored "
+                        "after every optimizer step, including during warmup) and train the new "
+                        "concept dims on novel images only, never labelled ones -- known concept "
+                        "detection then stays byte-for-byte identical to Stage 1 throughout")
     # Grounding DINO (labelled-set targets for newly discovered concepts; not installed by
     # default here -- see grounding_dino_tagging.py's docstring)
     p.add_argument("--gdino_config", type=str,

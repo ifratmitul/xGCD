@@ -366,17 +366,25 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
 # --------------------------------------------------------------------------- #
 def combined_fidelity_bce(ell: torch.Tensor, uq: torch.Tensor, mask_lab: torch.Tensor,
                           lab_lookup, novel_o_by_uq: Dict[int, torch.Tensor], c_old: int,
-                          pos_weight: torch.Tensor, device) -> torch.Tensor:
+                          pos_weight: torch.Tensor, device, novel_only: bool = False) -> torch.Tensor:
     """BCE over (a) labelled rows, all C dims, target from `lab_lookup`; and (b) unlabelled
     rows that have a RAM-derived target from novel-cluster discovery, new-dims-only, target
     from `novel_o_by_uq`. Rows with neither (unlabelled + not in novel_o_by_uq) contribute
     nothing, same as the original labelled-only behaviour. Returns one scalar: the sum of
     both terms' losses divided by the total number of (row, dim) pairs actually supervised,
-    so the two populations are combined on equal per-term footing rather than per-batch."""
+    so the two populations are combined on equal per-term footing rather than per-batch.
+
+    `novel_only=True` skips term (a) entirely -- the new concept dims then only ever get
+    supervision from novel images, never from labelled ones. Pairs with freezing the old CBL
+    rows (freeze_old_concepts_cbl_utils.py): once known classification can only ever read the
+    frozen old dims, there's nothing to gain from also training the new dims on known images
+    -- and per-concept quality actually suffers, since a concept like "blue" that's common to
+    many different, unrelated clusters gets diluted by cross-population averaging instead of
+    describing any one cluster distinctly."""
     terms = []
     n_terms = 0
 
-    if mask_lab.any():
+    if not novel_only and mask_lab.any():
         o_lab = lab_lookup.batch(uq[mask_lab].cpu().tolist()).to(device)
         terms.append(F.binary_cross_entropy_with_logits(
             ell[mask_lab], o_lab, pos_weight=pos_weight.to(device), reduction="sum"))
@@ -404,18 +412,26 @@ def combined_fidelity_bce(ell: torch.Tensor, uq: torch.Tensor, mask_lab: torch.T
 def warmup_cbl_and_refit_prototypes(model, merged_loader, lab_extract, unlab_extract, lab_lookup,
                                     novel_o_by_uq: Dict[int, torch.Tensor], c_old: int, k_known: int,
                                     k_total: int, cluster_uqs: Dict[int, List[int]],
-                                    pos_weight: torch.Tensor, args, device):
-    """Trains model.cbl (only) for `args.novel_cbl_warmup_epochs` epochs on ALL images (known
-    + novel) against combined_fidelity_bce, then recomputes `prototypes` as the TRUE mean of
-    the now-trained CBL's real output and refits the LDA metric from scratch -- replacing
-    both the RAM-frequency ASSUMPTION used at discovery time (point 5 in
-    discover_novel_concepts's docstring) and the identity-block covariance ASSUMPTION
-    (_extend_lda_block_diag) with real, measured values.
+                                    pos_weight: torch.Tensor, args, device, frozen=None,
+                                    novel_only: bool = False):
+    """Trains model.cbl (only) for `args.novel_cbl_warmup_epochs` epochs against
+    combined_fidelity_bce, then recomputes `prototypes` as the TRUE mean of the now-trained
+    CBL's real output and refits the LDA metric from scratch -- replacing both the
+    RAM-frequency ASSUMPTION used at discovery time (point 5 in discover_novel_concepts's
+    docstring) and the identity-block covariance ASSUMPTION (_extend_lda_block_diag) with
+    real, measured values.
 
     Why this matters: head.init_from_prototypes builds the classifier directly from
     `prototypes`, assuming the CBL already produces those values -- true for a warmed-up CBL,
     false for a freshly-grown one. Skipping this step is what caused the epoch-0 Old-ACC
     collapse this function exists to fix.
+
+    `frozen` (a FrozenCBLRows, see freeze_old_concepts_cbl_utils.py): if given, its rows are
+    restored after every optimizer step here too, so old-dim CBL weights stay exactly at
+    their pre-growth (post-Stage-1) values throughout warmup, not just during the main loop.
+    `novel_only`: if True, passed through to combined_fidelity_bce -- new dims train only on
+    novel images, never on labelled ones (see that function's docstring for why, when the old
+    dims are frozen anyway).
 
     Returns (prototypes, lda) if warmup ran, or (None, None) if
     `args.novel_cbl_warmup_epochs <= 0` -- caller keeps its existing prototypes/lda unchanged
@@ -438,13 +454,15 @@ def warmup_cbl_and_refit_prototypes(model, merged_loader, lab_extract, unlab_ext
             uq = uq.to(device).long()
             mask_lab_b = mask_lab.reshape(-1).bool().to(device)
             loss = combined_fidelity_bce(ell, uq, mask_lab_b, lab_lookup, novel_o_by_uq,
-                                         c_old, pos_weight, device)
+                                         c_old, pos_weight, device, novel_only=novel_only)
             if not torch.isfinite(loss):
                 logger.error(f"[concept-discovery warmup] non-finite loss at epoch {epoch+1} — aborting.")
                 raise RuntimeError("CBL warmup diverged.")
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if frozen is not None:
+                frozen.restore(model.cbl)
             total += float(loss); nb += 1
         logger.info(f"[concept-discovery warmup] epoch {epoch+1}/{args.novel_cbl_warmup_epochs} "
                    f"combined_bce={total/max(nb,1):.4f}")
