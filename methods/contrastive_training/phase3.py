@@ -176,14 +176,28 @@ def run_phase3(args):
     # score literally cannot depend on the new concepts' values, whatever CE does elsewhere.
     # Novel rows are untouched -- they're supposed to use the full concept set. Re-applied
     # after every optimizer step below so training can't drift these back away from zero.
+    #
+    # IMPORTANT: W/b must be RECOMPUTED from the old-dim SUB-BLOCK of precision + prototypes,
+    # not computed jointly (full C-dim precision) and then masked. lda.precision is a real,
+    # densely-fit matrix once warmup runs its full LDA refit -- its old/new blocks have
+    # non-zero cross-terms, so a jointly-computed W's "old-dim" columns are already
+    # contaminated by the new dims' prototype values through those cross-terms, before any
+    # masking happens. Zeroing columns afterward doesn't undo that. Recomputing from the
+    # old-dim sub-block alone reproduces exactly what a classifier over the original concept
+    # space would have been -- genuinely decoupled, not just superficially so.
     known_rows_old_dims_only = args.novel_concepts and args.num_concepts > num_old_concepts and args.novel_known_classes_use_old_concepts_only
     if known_rows_old_dims_only:
         with torch.no_grad():
-            head.fc.weight[:k_known, num_old_concepts:].zero_()
-            head.fc.bias[:k_known] = -0.5 * (head.fc.weight[:k_known] * prototypes[:k_known]).sum(dim=1)
+            c_old = num_old_concepts
+            P_old = lda.precision[:c_old, :c_old]
+            proto_old = prototypes[:k_known, :c_old]
+            W_old = proto_old @ P_old
+            head.fc.weight[:k_known, :c_old] = W_old
+            head.fc.weight[:k_known, c_old:] = 0.0
+            head.fc.bias[:k_known] = -0.5 * (W_old * proto_old).sum(dim=1)
         logger.info(f"[phase3] known-class head rows restricted to the original {num_old_concepts} "
-                   f"concepts (new-dim weights zeroed, bias recomputed to match) -- known "
-                   f"classification structurally unaffected by the new concepts")
+                   f"concepts (recomputed from the old-dim precision sub-block, not masked "
+                   f"post-hoc) -- known classification structurally unaffected by the new concepts")
 
     # ---- 4. pseudo-labels by uq: GT for labelled, head-argmax for unlabelled ----
     max_uq = int(max(int(lab_uq.max()), int(unlab_uq.max()))) + 1
