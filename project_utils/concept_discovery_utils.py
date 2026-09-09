@@ -278,6 +278,41 @@ def discover_novel_concepts(args, model, vocab: List[str], lookup, pos_weight: t
             delta_c = len(new_concepts)
             candidate_by_cluster = {cid: cands - set(universal) for cid, cands in candidate_by_cluster.items()}
             lab_o_by_uq = {u: _tags_to_o(lab_tags_by_uq[u], new_concepts) for u in lab_o_by_uq}
+
+    # ---- 2.c drop candidates that aren't enriched in the novel population relative to the
+    # known population -- catches a DIFFERENT failure mode than 2.b above. A concept can be
+    # rare everywhere (so it's never "near-universal" in any single known class) yet still
+    # appear at essentially the SAME rate in labelled and novel images -- e.g. "food": ~2.7%
+    # of labelled images vs ~2.9% of novel images. That concept isn't actually specific to the
+    # novel clusters it was discovered from; it's just a generic tag that happens to be
+    # uncommon everywhere, and pos_weight's rarity-based upweighting (see combined_fidelity_bce)
+    # then pushes the CBL to fire on it aggressively despite it having no discriminative value.
+    # The ratio of novel-frequency to known-frequency separates this from a genuinely
+    # novel-specific concept (e.g. "boat": 0.7% labelled vs 18.3% novel, ratio ~25x) even when
+    # the genuine concept also has a handful of nonzero/noisy known-population hits -- a plain
+    # "seen in both populations" test would incorrectly drop those too. A concept with zero
+    # known-population hits is treated as maximally enriched (ratio=inf) and always kept. Off
+    # by default (--novel_min_enrichment_ratio 0 disables it).
+    if delta_c > 0 and args.novel_min_enrichment_ratio > 0:
+        lab_o_all_now = torch.stack(list(lab_o_by_uq.values())) if lab_o_by_uq else torch.zeros(0, delta_c)
+        known_freq_t = lab_o_all_now.mean(0) if len(lab_o_all_now) else torch.zeros(delta_c)
+        novel_o_all_now = torch.stack([_tags_to_o(tags_by_uq[int(u)], new_concepts) for u in novel_uq.tolist()])
+        novel_freq_t = novel_o_all_now.mean(0)
+        known_freq = {c: float(known_freq_t[i]) for i, c in enumerate(new_concepts)}
+        novel_freq = {c: float(novel_freq_t[i]) for i, c in enumerate(new_concepts)}
+        ratio = {c: (novel_freq[c] / known_freq[c]) if known_freq[c] > 0 else float("inf")
+                for c in new_concepts}
+        min_ratio = args.novel_min_enrichment_ratio
+        not_enriched = [c for c in new_concepts if ratio[c] < min_ratio]
+        if not_enriched:
+            logger.info(f"[concept-discovery] dropping {len(not_enriched)} concepts not enriched "
+                       f"in novel vs known population (min_ratio={min_ratio}): " +
+                       ", ".join(f"{c}(known={known_freq[c]:.3f},novel={novel_freq[c]:.3f},"
+                                 f"ratio={ratio[c]:.2f})" for c in not_enriched))
+            new_concepts = [c for c in new_concepts if c not in not_enriched]
+            delta_c = len(new_concepts)
+            candidate_by_cluster = {cid: cands - set(not_enriched) for cid, cands in candidate_by_cluster.items()}
+            lab_o_by_uq = {u: _tags_to_o(lab_tags_by_uq[u], new_concepts) for u in lab_o_by_uq}
     # candidate NAME per cluster (its single most-frequent RAM tag) -- diagnostic only, to
     # eyeball how close RAM's own top guess is to the cluster's true identity, independent
     # of whatever concept-expansion strategy (if any) runs next.

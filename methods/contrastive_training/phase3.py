@@ -353,6 +353,14 @@ def get_phase3_parser():
                         "EXISTING known class's own labelled images (0 = disabled). A concept "
                         "near-universal for a known class is a poor discriminator regardless of "
                         "how common it is within the discovering novel cluster")
+    p.add_argument("--novel_min_enrichment_ratio", type=float, default=0.0,
+                   help="drop a candidate concept unless its novel-population frequency is at "
+                        "least this many times its known-population frequency (0 = disabled). "
+                        "Catches concepts that are rare in BOTH populations at essentially the "
+                        "same rate (e.g. 'food': ~2.7%% labelled vs ~2.9%% novel) -- too rare "
+                        "anywhere to trip --novel_drop_known_universal_thresh, but not actually "
+                        "specific to the novel clusters that discovered them either. A concept "
+                        "with zero known-population hits is always kept (ratio treated as infinite)")
     p.add_argument("--ram_pretrained", type=str, default=DEFAULT_RAM_PRETRAINED)
     p.add_argument("--ram_image_size", type=int, default=384)
     p.add_argument("--ram_batch_size", type=int, default=32)
