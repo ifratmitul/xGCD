@@ -16,7 +16,7 @@ already-correct known-class behavior.
 
 ## Pipeline
 
-![Novel-concept discovery and training pipeline](novel_concept_pipeline.svg)
+![Novel-concept discovery and training pipeline](ReadMe-Experiments and framework/novel_concept_pipeline.svg)
 
 **Phase 1 — Concept Discovery.** Starting from the clusters produced by phase 3's DPMM +
 peak-gate (already fixed at this point — no DPMM is re-run), we take the images closest to
