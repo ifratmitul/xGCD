@@ -65,12 +65,12 @@ spec:
             if [ "$SMOKE" = "1" ]; then
                 STAGE1_EPOCHS=2; REFRESH=2; P3_EPOCHS=4
             else
-                # 80 known classes + a larger concept vocabulary -> Stage 1 may want more
-                # epochs than CIFAR-10; bump STAGE1_EPOCHS if the CBL is under-trained.
-                # P3_EPOCHS=0 -> ESTIMATION-ONLY (no CE representation learning): runs the
-                # E-step + discovery diagnostics (~5 min) and stops. Set back to 15 for the
-                # FINAL run once beta / min_cluster / absorb / gate are calibrated.
-                STAGE1_EPOCHS=50; REFRESH=2; P3_EPOCHS=0
+                # FINAL run: CE on (P3_EPOCHS=15) at the locked operating point beta=0.01,
+                # gamma=0.1 (K^n=18). Cleanup all OFF: on CIFAR-100 the peak populations are
+                # interleaved (real 0.42-0.95, junk 0.25-0.92) so any gate drops real classes
+                # (permanent), and absorb/merge distances overlap. Keep all 18 -> CE trains 98
+                # classes; the 3-4 bad clusters cost only a few Hungarian columns (cheap error).
+                STAGE1_EPOCHS=50; REFRESH=2; P3_EPOCHS=30
             fi
 
             # ---- estimation geometry (same recipe as CIFAR-10; recalibrate after run 1) ----
@@ -79,8 +79,9 @@ spec:
             NOVELTY_ALPHA="0.2"     # may need raising: 80 known classes strengthen absorption bias
             TAU_MODE="empirical"
             GRAD_CLIP="1.0"
-            LDA_RIDGE="0.1"         # keep at 0.1: cond(Sigma)=600 was NOT the cause of K=1.
-                                    # (gamma is a gate-power experiment, judged on recall/purity, run alone.)
+            LDA_RIDGE="0.1"         # reverted: gamma=1.0 did NOT help the gate (recall 0.55->0.55,
+                                    # purity 55->57, overlap unchanged) and collapsed K^n 18->4.
+                                    # The known/novel overlap is FUNDAMENTAL, not a conditioning issue.
             DPMM_COV_SCALE="1.0"
             DPMM_ALPHA="1.0"
             # new-table barrier = C*ln(1+beta). beta=0.07 (~49 nats, CIFAR-10-matched) broke the
@@ -110,7 +111,7 @@ spec:
             CONF_TEMP="50"          # was 0(=C=727): over-flattened confidence to ~uniform (0.014).
                                     # ~50 gives a usable spread once K>1 (inert while K=1)
             REF_ACC="0.0"           # placeholder — no CIFAR-100 reference yet (log-only comparison)
-            P3_EXP="phase3_cifar100_8020_calib"
+            P3_EXP="phase3_cifar100_8020_final"
 
             # ============================================================
             # Stage 1 — fresh, seeded CBL (80 known classes)
