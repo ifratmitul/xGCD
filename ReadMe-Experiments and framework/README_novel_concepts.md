@@ -60,6 +60,52 @@ Together, these three mean the new concepts are learned entirely from what the n
 actually look like, and the known-class CBL rows — and therefore known-class classification —
 are provably unaffected by any of this.
 
+## Concept cleaning: why novel-population pos_weight alone wasn't enough
+
+`pos_weight` in the BCE fidelity loss is `neg/pos` — the inverse of how often a concept is
+*present*, measured within some population. Newly discovered concepts were originally weighted
+using their frequency in the *labelled* population, which badly underweights a concept that
+never occurs there at all (its `pos_weight` degenerates to a neutral `1.0`, since there's no
+positive count to divide by), even though it may be a real, frequent signal within the novel
+images that actually discovered it. `--novel_pos_weight_from_novel` fixes this by computing
+`pos_weight` from the *novel* population instead. Comparing the two for four discovered
+concepts:
+
+| Concept | Labelled pos_weight | Novel pos_weight |
+|---|---|---|
+| food | 36.5 | 32.9 |
+| tree frog | 1.0 | **27.1** |
+| gecko | 50.0 | 32.3 |
+| frog | 1.0 | **46.1** |
+
+This clearly rescues `tree frog` and `frog` — concepts invisible to the labelled population but
+real and common within their own novel cluster. It does **not** fix `food`: since `food` occurs
+at a similarly low rate in *both* populations (~2.7% labelled, ~2.9% novel), its pos_weight is
+high and barely changes either way (36.5 → 32.9). This exposes a real limit of pos_weight
+reweighting: it only rebalances how strongly the loss penalizes a missed positive label, based
+on that label's rarity within one population — it has no notion of whether the concept is
+actually *specific* to the cluster it was discovered from. A concept that's rare-but-generic
+still gets a large pos_weight and still gets pushed hard by the loss whenever it's a positive
+target, with nothing to suppress it for being uninformative. Reweighting can rescue a concept
+the labelled population made invisible, but it cannot remove a concept that's simply
+uninformative in both populations — that needs a filter, not a reweighting.
+
+**`--novel_min_enrichment_ratio`** is that filter. It compares a candidate concept's frequency
+in the novel population to its frequency in the known population,
+`ratio = f_novel(c) / f_known(c)` (a concept with zero known-population hits is treated as
+maximally enriched, `ratio = inf`, and always kept), and drops the concept if that ratio falls
+below the threshold. This targets a different failure mode than
+`--novel_drop_known_universal_thresh`: that filter only catches concepts that are *frequent* in
+some known class, so a concept that's simply rare everywhere (like `food`) never trips it.
+It's also deliberately a *ratio* test rather than a "seen in both populations" test — genuinely
+discriminative novel concepts (`boat`, `horse`, `dog`, `gecko`, ...) routinely have a handful of
+noisy, nonzero hits in the labelled set too, so dropping anything nonzero in labelled would
+throw away real concepts along with generic ones. Based on ratios computed across a full
+discovered-concept list (generic concepts clustering at 0.4x–1.6x, genuinely discriminative ones
+at 5x–60x+, with only one borderline case in between), **`2.0`** is a reasonable starting
+threshold. Off by default; applied right after the near-universal filter, before the CBL is
+grown, and composable with it.
+
 ## Key files
 
 | File | Purpose |
@@ -80,6 +126,7 @@ training exactly unless explicitly enabled.
 | `--novel_concepts` | `False` | Master switch for the whole feature |
 | `--novel_min_images_per_cluster` | `2` | Minimum images tagged per novel cluster before it contributes candidate concepts |
 | `--novel_drop_known_universal_thresh` | `0.0` | Drop a candidate concept if its frequency in any known class is >= this threshold |
+| `--novel_min_enrichment_ratio` | `0.0` | Drop a candidate concept unless its novel-population frequency is >= this many times its known-population frequency |
 | `--novel_cbl_warmup_epochs` | `0` | Epochs of CBL-only warm-up before prototype/LDA refit and head init |
 | `--novel_cbl_warmup_lr` | `1e-3` | Learning rate for the warm-up |
 | `--novel_bce_include_unlabelled` | `False` | Include novel-cluster images in the main BCE loss (not just labelled images) |
@@ -95,6 +142,7 @@ python methods/contrastive_training/phase3.py \
     --novel_concepts \
     --novel_min_images_per_cluster 200 \
     --novel_drop_known_universal_thresh 0.5 \
+    --novel_min_enrichment_ratio 2.0 \
     --novel_cbl_warmup_epochs 10 \
     --novel_bce_include_unlabelled \
     --novel_freeze_old_cbl \

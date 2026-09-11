@@ -4,7 +4,28 @@ novel_drop_known_universal_thresh    | 0.3, 0.5, 0.8   | No major difference; 0-
                                       |                 | plate/park/drive for side windows/windshield/taillights -- still valid
                                       |                 | car descriptors, not worse. truck proto @0.3: drive drops out, replaced
                                       |                 | by building:0.78 (worse/less relevant); 0.5 and 0.8 keep drive and look better.
-novel_cbl_warmup_epochs              | 10, 20          | No major difference
+novel_cbl_warmup_epochs              | 10, 20          | 10: All=0.9253 Old=0.9676 New=0.9041 (epoch0 0.9245->trained 0.9253).
+                                      |                 | 20: All=0.9241 Old=0.9581 New=0.9071 (epoch0 0.9249->trained 0.9241,
+                                      |                 | slight regression). 10 wins on Old/All; 20 slightly better on New --
+                                      |                 | more warmup lets the (unfrozen) CBL drift further on known concepts.
+                                      |                 | Frog cluster (proto[7]): 20 surfaces gecko:0.48 (new), 10 doesn't --
+                                      |                 | but both still miss frog/tree frog and keep food/floor/pet generic.
 novel_bce_include_unlabelled         | True, False     | False -> concepts stay generic (blue, black, food); True fixes it
-novel_freeze_old_cbl                 | True, False     | Pending
+novel_freeze_old_cbl                 | True, False     | True wins on all 3: Old=0.9691 New=0.9182 All=0.9351 (vs False:
+                                      |                 | Old=0.9676 New=0.9041 All=0.9253) -- deltas: Old +0.0015, New +0.0141,
+                                      |                 | All +0.0098. Known prototypes far crisper under True (class name
+                                      |                 | @~1.00, e.g. automobile:1.00) vs False (generic attributes dominate,
+                                      |                 | e.g. license plate:0.92): when known rows are trainable, joint training
+                                      |                 | on the expanded concept space measurably blurs Stage-1's crisp known
+                                      |                 | detectors, even though that blur only costs a small drop in aggregate
+                                      |                 | Old-ACC -- freezing preserves that sharpness exactly, byte-for-byte.
+                                      |                 | Frog cluster (proto[7]) still generic (food/floor) under True too --
+                                      |                 | freeze doesn't fix that, needs novel_min_enrichment_ratio.
+                                      |                 | DOWNSIDE: frozen known concepts leak into novel top-5s (dog cluster
+                                      |                 | cites cat:0.93, horse cluster cites deer:0.99/deer stand:0.99) -- real
+                                      |                 | shared visual features firing on a frozen row, not a training bug, but
+                                      |                 | confusing in a qualitative table (reader asks "why does dog cite cat?").
+                                      |                 | Not yet fixed. SOLUTION (idea, not implemented): for novel clusters, pick
+                                      |                 | top concepts from the NEW-concept dims only, not from all concepts --
+                                      |                 | reporting-level change, no training/weights affected.
 novel_pos_weight_from_novel          | --              | Pending
